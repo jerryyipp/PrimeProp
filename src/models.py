@@ -14,11 +14,13 @@ class Player(BaseModel):
 class PropLine(BaseModel):
     player_id: str = Field(...)
     provider: str = Field(...)
+    # Restricts stat types to a shared, canonical set understood across all providers.
     stat_type: Literal["Points", "Rebounds", "Assists", "PRA", "Threes"] = Field(...)
     threshold: float = Field(..., gt=0)
     over_odds: Optional[int] = Field(None)
     under_odds: Optional[int] = Field(None)
 
+    # Enforces the domain rule that all prop thresholds must be strictly positive.
     @field_validator("threshold")
     @classmethod
     def validate_threshold(cls, v: float) -> float:
@@ -33,7 +35,6 @@ class MarketSnapshot(BaseModel):
     game_id: str = Field(...)
     lines: List[PropLine] = Field(default_factory=list)
 
-    # INSERT_YOUR_CODE
 class Game(BaseModel):
     game_id: str = Field(..., description="Unique identifier for the game")
     home_team: str = Field(..., description="Name or code for the home team")
