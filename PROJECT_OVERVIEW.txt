@@ -82,7 +82,22 @@ improved later for accuracy, robustness, and features.
     or game-log API).
 
 
-1.4  requirements.txt
+1.4  src/optimizer.py — Expected value (+EV) optimizer
+
+  • PropEdge
+    - player_id, stat_type, provider, market_line, projected, edge.
+    - edge is defined as (projected - market_line) / market_line.
+  • compute_edge(projected, market_line)
+    - Applies the edge formula and enforces market_line > 0.
+  • rank_props_by_edge(snapshot, get_projection)
+    - Iterates all PropLine objects in a MarketSnapshot.
+    - Uses a ProjectionProvider (e.g. wrapping get_projection) to obtain
+      model projections for each (player_id, stat_type).
+    - Computes edge for each prop and returns a list of PropEdge sorted
+      by edge descending (best value props first).
+
+
+1.5  requirements.txt
 
   - Pydantic and related types.
   - Fuzzy matching: e.g. thefuzz and/or RapidFuzz, Levenshtein (see ingest.py
@@ -187,8 +202,9 @@ improved later for accuracy, robustness, and features.
 
   Current: The project defines core models (Player, PropLine, MarketSnapshot,
   Game), ingests live lines from two provider shapes (Odds API, PrizePicks)
-  with async HTTP and fuzzy name matching, and projects a single stat value
-  per player/stat using the last 10 games with a weighted or simple average.
+  with async HTTP and fuzzy name matching, projects a single stat value
+  per player/stat using the last 10 games with a weighted or simple average,
+  and computes/ranks edge between projections and market lines.
 
   Future: Improve projection accuracy with context (opponent, home/away, rest)
   and better methods (EWMA, regression to mean, backtests). Harden ingest
