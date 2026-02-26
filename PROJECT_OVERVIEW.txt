@@ -1,0 +1,199 @@
+================================================================================
+PRIMEPROP — PROJECT OVERVIEW & FUTURE IMPROVEMENTS
+================================================================================
+
+This file describes what the project currently does and where it can be
+improved later for accuracy, robustness, and features.
+
+
+--------------------------------------------------------------------------------
+1. WHAT EVERYTHING CURRENTLY DOES
+--------------------------------------------------------------------------------
+
+1.1  src/models.py — Core data models (Pydantic)
+
+  • Player
+    - id: internal identifier
+    - standardized_name: canonical name
+    - team: 2–3 letter code
+    - aliases: list of alternate names (e.g. "Steph Curry" for Stephen Curry)
+
+  • PropLine
+    - player_id, provider, stat_type (Points/Rebounds/Assists/PRA/Threes)
+    - threshold: the line number (must be > 0, enforced by validator)
+    - over_odds / under_odds: optional integers
+
+  • MarketSnapshot
+    - snapshot_id, timestamp (default UTC now), game_id
+    - lines: list of PropLine (all lines from one or more providers at a point in time)
+
+  • Game
+    - game_id, home_team, away_team, start_time (UTC)
+
+
+1.2  src/ingest.py — Multi-source data ingestor (async)
+
+  • FuzzyNameMatcher
+    - Built from a list of Player objects (standardized_name + aliases).
+    - match_player_id(name): uses fuzzy string matching (e.g. thefuzz) to map
+      a provider’s player name to a canonical Player id. Used to link
+      "Steph Curry" / "Stephen Curry" across books.
+
+  • ProviderIngestor (abstract)
+    - Interface: fetch_lines(session, matcher) -> List[PropLine].
+    - All concrete ingestors implement this.
+
+  • OddsApiIngestor
+    - Hits a The Odds API–style endpoint (URL + params/headers).
+    - Parses events -> bookmakers -> markets -> outcomes.
+    - Maps market keys (e.g. player_points) to canonical stat types.
+    - Groups over/under outcomes by player name + threshold, then uses
+      FuzzyNameMatcher to resolve player_id and emits PropLine objects.
+
+  • PrizePicksIngestor
+    - Hits a PrizePicks-style endpoint.
+    - Parses data/attributes (display_name, stat_type, line_score, etc.).
+    - Maps stat labels to canonical stat types, resolves player_id via matcher,
+      emits PropLine (often without over/under odds).
+
+  • fetch_multi_source_snapshot(snapshot_id, game_id, players, providers)
+    - Builds one FuzzyNameMatcher from players.
+    - Runs all providers’ fetch_lines concurrently with asyncio.gather.
+    - Merges all PropLine lists into a single MarketSnapshot.
+    - Failed providers are skipped (return_exceptions=True); no retries.
+
+
+1.3  src/projection.py — Historical stat projection engine
+
+  • get_projection(player_id, stat_type, historical_values, n_games=10, method=...)
+    - Takes a player id, stat type, and an ordered list of historical stat
+      values (oldest to newest).
+    - Uses the last n_games values only.
+    - Returns a single projected stat value (float).
+    - Methods:
+      - "weighted_average" (default): linear weights so the most recent game
+        has the highest weight.
+      - "simple_average": plain mean of the last n_games.
+
+  • compute_weighted_average(values) / compute_simple_average(values)
+    - Helpers used by get_projection; can be reused elsewhere.
+
+  • No data loading: the caller must supply historical_values (e.g. from DB
+    or game-log API).
+
+
+1.4  requirements.txt
+
+  - Pydantic and related types.
+  - Fuzzy matching: e.g. thefuzz and/or RapidFuzz, Levenshtein (see ingest.py
+    imports for actual usage).
+  - Async HTTP: aiohttp (used by ingest.py).
+
+
+--------------------------------------------------------------------------------
+2. WHERE THE PROJECT COULD IMPROVE (ACCURACY & BEYOND)
+--------------------------------------------------------------------------------
+
+2.1  Projection accuracy
+
+  • Add context features
+    - Opponent (defense rating, pace).
+    - Home vs away.
+    - Back-to-back games, rest days.
+    - Minutes/role (starter vs bench, recent trend).
+
+  • Better baseline methods
+    - Exponential smoothing (EWMA) instead of fixed linear weights.
+    - Regression to the mean (pull toward season or league average when
+      sample is small or noisy).
+    - Optional simple linear regression on “game number” to capture trend
+      (e.g. rising minutes).
+
+  • Use more history where helpful
+    - Parameterize n_games (e.g. 5 vs 10 vs 15) or use decay weights over
+      a longer window.
+    - Season-to-date vs last-N-games as optional inputs.
+
+  • Validation and monitoring
+    - Backtest: compare projected vs actual on historical data; report MAE,
+      bias, by stat type.
+    - Track calibration over time (e.g. are 26-point projections right 50%
+      of the time when line is 26?).
+
+
+2.2  Ingest and data quality
+
+  • Name matching
+    - Tune score_cutoff (or use multiple thresholds) and log low-confidence
+      matches for review.
+    - Add optional manual overrides (e.g. “Provider X uses this id for
+      this name”).
+    - Consider league/team context to reduce wrong matches (e.g. same name
+      in different sports).
+
+  • Provider parsing
+    - Validate against real API responses; extend STAT_TYPE_* maps and
+      payload parsing as providers change.
+    - Normalize odds (American to decimal or implied prob) in one place for
+      consistent use in models.
+
+  • Robustness
+    - Retries with backoff for failed provider requests.
+    - Timeouts and circuit breakers so one bad provider doesn’t block
+      snapshots.
+    - Idempotent snapshot ids and optional persistence (DB) for
+      MarketSnapshot so you can replay and audit.
+
+
+2.3  Models and schema
+
+  • Optional fields for richer lines
+    - Line movement (open vs current); timestamp per line if available.
+    - Same stat from same provider with multiple thresholds (e.g. 24.5 vs 25.5
+      points) as separate PropLine or explicit “alternates”.
+
+  • Game and schedule
+    - Link MarketSnapshot and PropLine to Game (e.g. game_id) and optionally
+      to Player/team so projections can use “next opponent” and “home/away”.
+
+  • Historical game logs
+    - Define a small schema for “player stat per game” (player_id, game_id,
+      stat_type, value, date) so projection has a single place to pull
+      historical_values from.
+
+
+2.4  End-to-end and operations
+
+  • Pipeline
+    - Script or job that: (1) fetches live lines (fetch_multi_source_snapshot),
+      (2) loads last N games from storage, (3) runs get_projection per
+      player/stat, (4) compares projection to line (e.g. edge vs threshold).
+    - Config (or env) for API keys, URLs, n_games, method.
+
+  • Testing
+    - Unit tests for projection (known history -> expected value).
+    - Unit tests for ingest parsing (fixed JSON -> expected PropLine list).
+    - Integration test with mock HTTP so multi-source snapshot runs without
+      real APIs.
+
+  • Observability
+    - Logging (and optionally metrics) for ingest failures, match rate,
+      projection vs line distribution.
+
+
+--------------------------------------------------------------------------------
+3. SUMMARY
+--------------------------------------------------------------------------------
+
+  Current: The project defines core models (Player, PropLine, MarketSnapshot,
+  Game), ingests live lines from two provider shapes (Odds API, PrizePicks)
+  with async HTTP and fuzzy name matching, and projects a single stat value
+  per player/stat using the last 10 games with a weighted or simple average.
+
+  Future: Improve projection accuracy with context (opponent, home/away, rest)
+  and better methods (EWMA, regression to mean, backtests). Harden ingest
+  (retries, parsing validation, name-match tuning). Add storage for game logs
+  and snapshots, a small pipeline to compare projections to lines, and tests
+  plus logging so the system is reliable and measurable.
+
+================================================================================
