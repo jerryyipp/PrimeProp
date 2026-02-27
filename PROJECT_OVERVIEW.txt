@@ -97,7 +97,22 @@ improved later for accuracy, robustness, and features.
       by edge descending (best value props first).
 
 
-1.5  requirements.txt
+1.5  src/alerting.py — Real-time alerting (Telegram/Discord)
+
+  • confidence_score(edge): edge as percentage (e.g. 7.5 for 7.5%).
+  • format_alert(prop_edge, player_name): message with Player Name, Prop Line,
+    and Confidence Score.
+  • send_telegram(message, bot_token, chat_id) / send_discord(message, webhook_url)
+    - Send a message via Telegram Bot API or Discord webhook.
+  • alert_high_value_props(ranked_edges, min_edge=0.05, player_names=..., ...)
+    - Filters props with edge > min_edge (default 5%), formats each, and sends
+      to Telegram and/or Discord. Uses TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+      DISCORD_WEBHOOK_URL from env if not passed.
+  • test_alerts.py: test/demo script that runs optimizer then alert_high_value_props
+    so your phone receives a notification when a high-value prop is detected.
+
+
+1.6  requirements.txt
 
   - Pydantic and related types.
   - Fuzzy matching: e.g. thefuzz and/or RapidFuzz, Levenshtein (see ingest.py
@@ -204,7 +219,8 @@ improved later for accuracy, robustness, and features.
   Game), ingests live lines from two provider shapes (Odds API, PrizePicks)
   with async HTTP and fuzzy name matching, projects a single stat value
   per player/stat using the last 10 games with a weighted or simple average,
-  and computes/ranks edge between projections and market lines.
+  computes/ranks edge between projections and market lines, and sends
+  Telegram/Discord alerts when edge > 5% (player name, prop line, confidence score).
 
   Future: Improve projection accuracy with context (opponent, home/away, rest)
   and better methods (EWMA, regression to mean, backtests). Harden ingest
