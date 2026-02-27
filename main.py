@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 from src.models import Player
+from src.database import DatabaseManager
 from src.ingest import OddsApiIngestor, fetch_multi_source_snapshot
 from src.optimizer import rank_props_by_edge
 from src.projection import StatType
@@ -109,6 +110,22 @@ async def main() -> None:
     # Fire off alerts
     high_value_alerts = alert_high_value_props(ranked, min_edge=0.05)
     print(f"\nSuccessfully fired alerts for {len(high_value_alerts)} high-value pre-game props!")
+
+    # Persist high-value picks to database
+    db = DatabaseManager()
+    player_names = {p.id: p.standardized_name for p in PLAYERS}
+    for edge in high_value_alerts:
+        player_name = player_names.get(edge.player_id, edge.player_id)
+        db.log_pick(
+            player_name=player_name,
+            stat_type=edge.stat_type,
+            market_line=edge.market_line,
+            projected=edge.projected,
+            edge=edge.edge,
+            recommended_side=edge.recommended_side,
+        )
+    print(f"Saved {len(high_value_alerts)} picks to the database.")
+    db.close()
 
 
 if __name__ == "__main__":
