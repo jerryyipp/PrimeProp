@@ -19,26 +19,64 @@ STAT_TYPE_KEY_MAP: Dict[str, str] = {
 
 
 # Resolves noisy provider player names to canonical Player IDs using fuzzy string matching.
+# Learns new players on the fly when it encounters names that are not in the initial list.
 class FuzzyNameMatcher:
     def __init__(self, players: Iterable[Player], score_cutoff: int = 80) -> None:
         self._score_cutoff = score_cutoff
+        # Maps any known name/alias to a canonical Player.id
         self._name_to_player_id: Dict[str, str] = {}
+        # Tracks Player objects by their id (including dynamically discovered ones)
+        self._players_by_id: Dict[str, Player] = {}
 
         for player in players:
+            self._players_by_id[player.id] = player
             self._name_to_player_id[player.standardized_name] = player.id
             for alias in player.aliases:
                 self._name_to_player_id[alias] = player.id
 
         self._choices: List[str] = list(self._name_to_player_id.keys())
 
-    # Returns the best-matching Player.id for a provider-supplied name, or None if nothing clears the score cutoff.
+    def _create_player_from_name(self, name: str) -> Player:
+        """
+        Create a new Player for a previously unseen name.
+
+        Since we don't have team context here, we default team to 'UNK'.
+        """
+        player_id = name
+        # Very rare, but avoid collisions if the exact same id already exists.
+        if player_id in self._players_by_id:
+            suffix = 2
+            base = player_id
+            while f"{base} ({suffix})" in self._players_by_id:
+                suffix += 1
+            player_id = f"{base} ({suffix})"
+
+        player = Player(
+            id=player_id,
+            standardized_name=name,
+            team="UNK",
+            aliases=[],
+        )
+        self._players_by_id[player.id] = player
+        self._name_to_player_id[name] = player.id
+        self._choices = list(self._name_to_player_id.keys())
+        return player
+
+    # Returns the best-matching Player.id for a provider-supplied name.
+    # If no match clears the cutoff (or there are no known players yet),
+    # a new Player is created dynamically.
     def match_player_id(self, name: str) -> Optional[str]:
-        if not name or not self._choices:
+        if not name:
             return None
+
+        # If we have no known names yet, learn this player immediately.
+        if not self._choices:
+            return self._create_player_from_name(name).id
 
         match = process.extractOne(name, self._choices, score_cutoff=self._score_cutoff)
         if match is None:
-            return None
+            # Below cutoff or no close match: treat as new player
+            return self._create_player_from_name(name).id
 
         matched_name = match[0]
         return self._name_to_player_id.get(matched_name)

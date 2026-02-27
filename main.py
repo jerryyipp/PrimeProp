@@ -5,47 +5,25 @@ run the optimizer, and print/alert the top +EV props.
 import os
 import asyncio
 import aiohttp
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
-from src.models import Player
 from src.database import DatabaseManager
 from src.ingest import OddsApiIngestor, fetch_multi_source_snapshot
 from src.optimizer import rank_props_by_edge
-from src.projection import StatType
+from src.projection import StatType, get_projection
 from src.alerting import alert_high_value_props
+from src.stats import fetch_last_n_game_values
 
 load_dotenv()
 
-# Add a few players you know are playing in the UPCOMING games tonight/tomorrow!
-PLAYERS = [
-    Player(id="lebron", standardized_name="LeBron James", team="LAL", aliases=["LeBron", "LBJ"]),
-    Player(id="wembanyama", standardized_name="Victor Wembanyama", team="SAS", aliases=["Wemby"]),
-    Player(id="edwards", standardized_name="Anthony Edwards", team="MIN", aliases=["Ant"]),
-    Player(id="durant", standardized_name="Kevin Durant", team="PHX", aliases=["KD"]),
-    Player(id="luka", standardized_name="Luka Doncic", team="DAL", aliases=["Luka"]),
-    Player(id="tatum", standardized_name="Jayson Tatum", team="BOS", aliases=["JT", "Tatum"]),
-    Player(id="jokic", standardized_name="Nikola Jokic", team="DEN", aliases=["Joker"]),
-]
-
-
-def dummy_projection(player_id: str, stat_type: StatType) -> float:
-    """Dummy projection: fixed values per stat type."""
-    defaults: dict[str, float] = {
-        "Points": 26.0,
-        "Rebounds": 10.0,
-        "Assists": 7.0,
-        "PRA": 40.0,
-        "Threes": 3.0,
-    }
-    return defaults.get(stat_type, 20.0)
-
 
 async def get_upcoming_event_ids(api_key: str) -> list[str]:
-    """Fetches games and returns IDs only for games that have NOT started yet."""
+    """Fetches games and returns IDs only for games in today's betting day that have NOT started yet."""
     url = "https://api.the-odds-api.com/v4/sports/basketball_nba/events"
     upcoming_ids = []
     now = datetime.now(timezone.utc)
+    current_betting_date = (now - timedelta(hours=6)).date()
 
     async with aiohttp.ClientSession() as session:
         async with session.get(url, params={"apiKey": api_key}) as resp:
@@ -56,8 +34,11 @@ async def get_upcoming_event_ids(api_key: str) -> list[str]:
                 commence_str = game["commence_time"].replace("Z", "+00:00")
                 commence_time = datetime.fromisoformat(commence_str)
 
-                # ONLY grab games where the tip-off time is in the future
-                if commence_time > now:
+                # Implement a 1:00 AM EST betting-day rollover (UTC-5 ≈ 6-hour shift).
+                game_betting_date = (commence_time - timedelta(hours=6)).date()
+
+                # Only grab games where the tip-off time is in the future AND in today's betting day.
+                if game_betting_date == current_betting_date and commence_time > now:
                     upcoming_ids.append(game["id"])
 
     return upcoming_ids
@@ -71,7 +52,7 @@ async def main() -> None:
     print("Checking for upcoming pre-game matchups...")
     upcoming_event_ids = await get_upcoming_event_ids(api_key)
     if not upcoming_event_ids:
-        print("No upcoming pre-game matchups found. All games for the day have already started!")
+        print("No more upcoming games for today. All matchups have tipped off. Check back tomorrow morning for the new slate!")
         return
 
     print(f"Found {len(upcoming_event_ids)} upcoming games. Fetching pre-game player props...")
@@ -94,10 +75,38 @@ async def main() -> None:
     snapshot = await fetch_multi_source_snapshot(
         snapshot_id="pre-game-1",
         game_id="upcoming_nba_slate",
-        players=PLAYERS,
+        players=[],
         providers=ingestors,
     )
-    ranked = rank_props_by_edge(snapshot, dummy_projection)
+
+    # Build projections from real historical stats (last 10 games, weighted average)
+    print("Fetching historical stats and building projections...")
+    projections: dict[tuple[str, StatType], float] = {}
+    unique_keys = {(line.player_id, line.stat_type) for line in snapshot.lines}
+
+    async with aiohttp.ClientSession() as stats_session:
+        for player_id, stat_type in unique_keys:
+            values = await fetch_last_n_game_values(
+                player_name=player_id,
+                stat_type=stat_type,
+                n_games=10,
+                session=stats_session,
+            )
+            if not values:
+                continue
+            proj = get_projection(
+                player_id=player_id,
+                stat_type=stat_type,
+                historical_values=values,
+                n_games=10,
+                method="weighted_average",
+            )
+            projections[(player_id, stat_type)] = proj
+
+    def projection_provider(player_id: str, stat_type: StatType) -> float | None:
+        return projections.get((player_id, stat_type))
+
+    ranked = rank_props_by_edge(snapshot, projection_provider)
 
     print("\nTop 5 PRE-GAME +EV bets:")
     for i, edge in enumerate(ranked[:5], 1):
@@ -111,21 +120,20 @@ async def main() -> None:
     high_value_alerts = alert_high_value_props(ranked, min_edge=0.05)
     print(f"\nSuccessfully fired alerts for {len(high_value_alerts)} high-value pre-game props!")
 
-    # Persist high-value picks to database
-    db = DatabaseManager()
-    player_names = {p.id: p.standardized_name for p in PLAYERS}
-    for edge in high_value_alerts:
-        player_name = player_names.get(edge.player_id, edge.player_id)
-        db.log_pick(
-            player_name=player_name,
-            stat_type=edge.stat_type,
-            market_line=edge.market_line,
-            projected=edge.projected,
-            edge=edge.edge,
-            recommended_side=edge.recommended_side,
-        )
-    print(f"Saved {len(high_value_alerts)} picks to the database.")
-    db.close()
+    # Persist high-value picks to database (only if we have any)
+    if high_value_alerts:
+        db = DatabaseManager()
+        for edge in high_value_alerts:
+            db.log_pick(
+                player_name=edge.player_id,
+                stat_type=edge.stat_type,
+                market_line=edge.market_line,
+                projected=edge.projected,
+                edge=edge.edge,
+                recommended_side=edge.recommended_side,
+            )
+        print(f"Saved {len(high_value_alerts)} picks to the database.")
+        db.close()
 
 
 if __name__ == "__main__":
