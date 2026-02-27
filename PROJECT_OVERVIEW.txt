@@ -85,7 +85,8 @@ improved later for accuracy, robustness, and features.
 1.4  src/optimizer.py — Expected value (+EV) optimizer
 
   • PropEdge
-    - player_id, stat_type, provider, market_line, projected, edge.
+    - player_id, stat_type, provider, market_line, projected, edge,
+      recommended_side (Over/Under/Pass).
     - edge is defined as (projected - market_line) / market_line.
   • compute_edge(projected, market_line)
     - Applies the edge formula and enforces market_line > 0.
@@ -105,16 +106,42 @@ improved later for accuracy, robustness, and features.
   • send_telegram(message, bot_token, chat_id) / send_discord(message, webhook_url)
     - Send a message via Telegram Bot API or Discord webhook.
   • alert_high_value_props(ranked_edges, min_edge=0.05, player_names=..., ...)
-    - Filters props with edge > min_edge (default 5%), formats each, and sends
-      to Telegram and/or Discord. Uses TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
-      DISCORD_WEBHOOK_URL from env if not passed.
+    - Filters props with |edge| > min_edge (default 5%) so both profitable
+      Overs (edge > 0.05) and Unders (edge < -0.05) are alerted.
+    - Formats each and sends to Telegram and/or Discord. Uses
+      TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DISCORD_WEBHOOK_URL from env if
+      not passed.
   • test_alerts.py: test/demo script that runs optimizer then alert_high_value_props
     so your phone receives a notification when a high-value prop is detected.
 
 
-1.6  requirements.txt
+1.6  src/database.py — Persistence and performance tracking
 
-  - Pydantic and related types.
+  • DatabaseManager
+    - Connects to primeprop.db (creates if not exists). Uses built-in sqlite3.
+    - Table picks: id, timestamp, player_name, stat_type, market_line,
+      projected, edge, recommended_side, actual_result (NULL), won (NULL).
+    - log_pick(...): inserts a pre-game pick with current UTC timestamp.
+    - get_win_rate(): returns (total_graded, wins, losses, win_pct). Only
+      counts rows where won IS NOT NULL; returns (0,0,0,0.0) when none graded.
+  • main.py persists high-value alerts via log_pick after alerting.
+
+
+1.7  main.py — Pre-game CLV pipeline
+
+  • Fetches upcoming NBA events from /v4/sports/basketball_nba/events; filters
+    to games that have not started yet (commence_time > now).
+  • Creates one OddsApiIngestor per event via
+    /v4/sports/basketball_nba/events/{eventId}/odds.
+  • Runs fetch_multi_source_snapshot with all ingestors, rank_props_by_edge,
+    alert_high_value_props, then logs each high-value pick to the database.
+  • Test scripts: test_projection.py, test_optimizer.py, test_database.py,
+    test_alerts.py, radar.py.
+
+
+1.8  requirements.txt
+
+  - Pydantic, aiohttp, python-dotenv, thefuzz/RapidFuzz, etc.
   - Fuzzy matching: e.g. thefuzz and/or RapidFuzz, Levenshtein (see ingest.py
     imports for actual usage).
   - Async HTTP: aiohttp (used by ingest.py).
@@ -216,11 +243,12 @@ improved later for accuracy, robustness, and features.
 --------------------------------------------------------------------------------
 
   Current: The project defines core models (Player, PropLine, MarketSnapshot,
-  Game), ingests live lines from two provider shapes (Odds API, PrizePicks)
-  with async HTTP and fuzzy name matching, projects a single stat value
-  per player/stat using the last 10 games with a weighted or simple average,
-  computes/ranks edge between projections and market lines, and sends
-  Telegram/Discord alerts when edge > 5% (player name, prop line, confidence score).
+  Game), ingests pre-game NBA odds from The Odds API per-event with async HTTP
+  and fuzzy name matching, projects a single stat value per player/stat using
+  the last 10 games with a weighted or simple average, computes/ranks edge
+  between projections and market lines, recommends Over/Under/Pass, sends
+  Telegram/Discord alerts when |edge| > 5%, and logs high-value picks to
+  SQLite for win-rate tracking (manual grading).
 
   Future: Improve projection accuracy with context (opponent, home/away, rest)
   and better methods (EWMA, regression to mean, backtests). Harden ingest
