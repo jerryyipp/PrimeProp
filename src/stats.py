@@ -1,33 +1,22 @@
 """
 Historical stats client and simple 24-hour cache for player game logs.
-
-Uses a free public NBA stats API (balldontlie.io) to fetch the last N games
-for a given player and stat type. Results are cached on disk for 24 hours to
-avoid repeatedly hitting the API for the same player/stat combination.
+Uses the official nba_api package to fetch the last N games directly from NBA.com.
+Results are cached on disk for 24 hours to avoid repeatedly hitting the API.
 """
 
+import asyncio
 import json
-import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
-import aiohttp
+from nba_api.stats.endpoints import playergamelog
+from nba_api.stats.static import players
+
+from src.projection import StatType
 
 CACHE_PATH = Path(__file__).resolve().parent.parent / "stats_cache.json"
 CACHE_TTL = timedelta(hours=24)
-
-_BALLDONTLIE_API_KEY = os.getenv("BALLDONTLIE_API_KEY")
-_HEADERS = {"Authorization": f"Bearer {_BALLDONTLIE_API_KEY}"} if _BALLDONTLIE_API_KEY else {}
-
-# Map our stat types to balldontlie fields.
-_STAT_FIELD_MAP: Dict[StatType, Optional[str]] = {
-    "Points": "pts",
-    "Rebounds": "reb",
-    "Assists": "ast",
-    "PRA": None,  # computed as pts + reb + ast
-    "Threes": "fg3m",
-}
 
 
 def _load_cache() -> Dict[str, Dict]:
@@ -48,7 +37,6 @@ def _save_cache(cache: Dict[str, Dict]) -> None:
         with CACHE_PATH.open("w", encoding="utf-8") as f:
             json.dump(cache, f)
     except OSError:
-        # Cache failures should never break the main pipeline.
         pass
 
 
@@ -84,68 +72,37 @@ def _set_cached_values(player_name: str, stat_type: StatType, n_games: int, valu
     _save_cache(cache)
 
 
-async def _fetch_player_id(session: aiohttp.ClientSession, player_name: str) -> Optional[int]:
-    """
-    Resolve a player name to a balldontlie player id using the search endpoint.
-    """
-    url = "https://api.balldontlie.io/v1/players"
-    params = {"search": player_name}
-    async with session.get(url, params=params, headers=_HEADERS) as resp:
-        if resp.status != 200:
-            return None
-        data = await resp.json()
-        items = data.get("data") or []
-        if not items:
-            return None
-        # Take the first match; in practice you may want league/team filters.
-        return items[0].get("id")
-
-
-async def _fetch_last_n_games_raw(
-    session: aiohttp.ClientSession,
-    player_id: int,
-    n_games: int,
-) -> List[Dict]:
-    """
-    Fetch raw game log stats for a player and return the most recent N games.
-    """
-    url = "https://api.balldontlie.io/v1/stats"
-    params = {
-        "player_ids[]": player_id,
-        "per_page": n_games,
-        "postseason": "false",
-    }
-    async with session.get(url, params=params, headers=_HEADERS) as resp:
-        if resp.status != 200:
-            return []
-        data = await resp.json()
-        items = data.get("data") or []
-        # Ensure oldest -> newest order based on game date.
-        items.sort(key=lambda g: g.get("game", {}).get("date", ""))
-        return items[-n_games:]
-
-
-def _extract_stat_values(games: List[Dict], stat_type: StatType) -> List[float]:
-    if not games:
+def _fetch_from_nba_api_sync(player_name: str, stat_type: StatType, n_games: int) -> List[float]:
+    """Synchronous worker that hits NBA.com."""
+    nba_players = players.find_players_by_full_name(player_name)
+    if not nba_players:
         return []
-    field = _STAT_FIELD_MAP[stat_type]
+
+    player_id = nba_players[0]["id"]
+    try:
+        log = playergamelog.PlayerGameLog(player_id=player_id)
+        df = log.get_data_frames()[0]
+    except Exception as e:
+        print(f"DEBUG: NBA API error for {player_name}: {e}")
+        return []
+    if df.empty:
+        return []
+    # NBA.com returns newest games first. We want the last n_games, ordered oldest -> newest
+    df = df.head(n_games).iloc[::-1]
     values: List[float] = []
-    for g in games:
-        stats = g
+    for _, row in df.iterrows():
         try:
-            if stat_type == "PRA":
-                pts = float(stats.get("pts", 0.0))
-                reb = float(stats.get("reb", 0.0))
-                ast = float(stats.get("ast", 0.0))
-                values.append(pts + reb + ast)
-            else:
-                if field is None:
-                    continue
-                raw = stats.get(field)
-                if raw is None:
-                    continue
-                values.append(float(raw))
-        except (TypeError, ValueError):
+            if stat_type == "Points":
+                values.append(float(row["PTS"]))
+            elif stat_type == "Rebounds":
+                values.append(float(row["REB"]))
+            elif stat_type == "Assists":
+                values.append(float(row["AST"]))
+            elif stat_type == "PRA":
+                values.append(float(row["PTS"] + row["REB"] + row["AST"]))
+            elif stat_type == "Threes":
+                values.append(float(row["FG3M"]))
+        except (KeyError, ValueError, TypeError):
             continue
     return values
 
@@ -154,35 +111,19 @@ async def fetch_last_n_game_values(
     player_name: str,
     stat_type: StatType,
     n_games: int = 10,
-    session: Optional[aiohttp.ClientSession] = None,
+    session=None,  # Kept for compatibility with main.py calls
 ) -> List[float]:
     """
-    Fetch last N game values for (player_name, stat_type).
-
-    Uses a 24-hour on-disk cache keyed by (player_name, stat_type, n_games).
-    Returns an ordered list [oldest, ..., newest]; may be shorter than N if
-    not enough games are available, or empty if the player cannot be found.
+    Fetch last N game values using the nba_api package.
     """
     cached = _get_cached_values(player_name, stat_type, n_games)
     if cached is not None:
         return cached
 
-    owns_session = False
-    if session is None:
-        session = aiohttp.ClientSession()
-        owns_session = True
-
-    try:
-        player_id = await _fetch_player_id(session, player_name)
-        if player_id is None:
-            return []
-
-        games = await _fetch_last_n_games_raw(session, player_id, n_games)
-        values = _extract_stat_values(games, stat_type)
-        if values:
-            _set_cached_values(player_name, stat_type, n_games, values)
-        return values
-    finally:
-        if owns_session and session is not None:
-            await session.close()
-
+    # A tiny 0.5s delay to safely navigate NBA.com's spam filters
+    await asyncio.sleep(0.5)
+    # Run the synchronous nba_api network calls safely in a background thread
+    values = await asyncio.to_thread(_fetch_from_nba_api_sync, player_name, stat_type, n_games)
+    if values:
+        _set_cached_values(player_name, stat_type, n_games, values)
+    return values

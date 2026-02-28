@@ -7,6 +7,7 @@ import asyncio
 import aiohttp
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
+load_dotenv()  # MUST BE LOADED BEFORE SRC MODULES
 
 from src.database import DatabaseManager
 from src.ingest import OddsApiIngestor, fetch_multi_source_snapshot
@@ -14,8 +15,6 @@ from src.optimizer import rank_props_by_edge
 from src.projection import StatType, get_projection
 from src.alerting import alert_high_value_props
 from src.stats import fetch_last_n_game_values
-
-load_dotenv()
 
 
 async def get_upcoming_event_ids(api_key: str) -> list[str]:
@@ -67,6 +66,7 @@ async def main() -> None:
                     "apiKey": api_key,
                     "regions": "us",
                     "markets": "player_points,player_rebounds,player_assists",
+                    "oddsFormat": "american",
                 },
             )
         )
@@ -79,13 +79,19 @@ async def main() -> None:
         providers=ingestors,
     )
 
+    print(f"DEBUG: Total props ingested: {len(snapshot.lines)}")
+
     # Build projections from real historical stats (last 10 games, weighted average)
     print("Fetching historical stats and building projections...")
     projections: dict[tuple[str, StatType], float] = {}
     unique_keys = {(line.player_id, line.stat_type) for line in snapshot.lines}
 
+    print(f"DEBUG: Unique (player, stat_type) pairs found: {len(unique_keys)}")
+
+    total_pairs = len(unique_keys)
     async with aiohttp.ClientSession() as stats_session:
-        for player_id, stat_type in unique_keys:
+        for i, (player_id, stat_type) in enumerate(unique_keys, 1):
+            print(f"[{i}/{total_pairs}] Fetching stats for {player_id} ({stat_type}).")
             values = await fetch_last_n_game_values(
                 player_name=player_id,
                 stat_type=stat_type,
@@ -102,6 +108,8 @@ async def main() -> None:
                 method="weighted_average",
             )
             projections[(player_id, stat_type)] = proj
+
+    print(f"DEBUG: Successfully computed projections for {len(projections)} pairs.")
 
     def projection_provider(player_id: str, stat_type: StatType) -> float | None:
         return projections.get((player_id, stat_type))

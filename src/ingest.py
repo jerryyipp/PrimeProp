@@ -133,7 +133,18 @@ class OddsApiIngestor(ProviderIngestor):
     # Transforms a raw The Odds API payload into PropLine objects, grouping over/under odds by player and threshold.
     def _parse_payload(self, payload: Any, matcher: FuzzyNameMatcher) -> List[PropLine]:
         lines: List[PropLine] = []
-        events = payload if isinstance(payload, list) else payload.get("data", [])
+
+        # Handle list responses, single-game dict responses, and generic dicts with "data" keys.
+        if isinstance(payload, list):
+            events = payload
+        elif isinstance(payload, dict) and "bookmakers" in payload:
+            # Single game from /events/{id}/odds
+            events = [payload]
+        elif isinstance(payload, dict):
+            # Generic collection wrapper, e.g. {"data": [...]}
+            events = payload.get("data", [])
+        else:
+            events = []
 
         for event in events:
             bookmakers = event.get("bookmakers", [])

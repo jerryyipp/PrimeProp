@@ -17,8 +17,8 @@ class PropLine(BaseModel):
     # Restricts stat types to a shared, canonical set understood across all providers.
     stat_type: Literal["Points", "Rebounds", "Assists", "PRA", "Threes"] = Field(...)
     threshold: float = Field(..., gt=0)
-    over_odds: Optional[int] = Field(None)
-    under_odds: Optional[int] = Field(None)
+    over_odds: Optional[float] = Field(None)
+    under_odds: Optional[float] = Field(None)
 
     # Enforces the domain rule that all prop thresholds must be strictly positive.
     @field_validator("threshold")

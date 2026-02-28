@@ -21,18 +21,18 @@ from .projection import StatType
 ProjectionProvider = Callable[[str, StatType], Optional[float]]
 
 
-def calculate_implied_probability(odds: Optional[int]) -> Optional[float]:
+def calculate_implied_probability(odds: Optional[float]) -> Optional[float]:
     """
-    Convert American odds (int, e.g. -110 or +125) to implied probability (0 to 1).
+    Convert American odds (e.g. -110 or +125) to implied probability (0 to 1).
 
     Returns None if odds is None.
     """
     if odds is None:
         return None
     if odds > 0:
-        return 100 / (odds + 100)
+        return 100.0 / (odds + 100.0)
     else:
-        return abs(odds) / (abs(odds) + 100)
+        return abs(odds) / (abs(odds) + 100.0)
 
 
 class PropEdge(BaseModel):
