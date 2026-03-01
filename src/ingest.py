@@ -21,7 +21,7 @@ STAT_TYPE_KEY_MAP: Dict[str, str] = {
 # Resolves noisy provider player names to canonical Player IDs using fuzzy string matching.
 # Learns new players on the fly when it encounters names that are not in the initial list.
 class FuzzyNameMatcher:
-    def __init__(self, players: Iterable[Player], score_cutoff: int = 80) -> None:
+    def __init__(self, players: Iterable[Player], score_cutoff: int = 95) -> None:
         self._score_cutoff = score_cutoff
         # Maps any known name/alias to a canonical Player.id
         self._name_to_player_id: Dict[str, str] = {}
@@ -184,11 +184,30 @@ class OddsApiIngestor(ProviderIngestor):
                         elif outcome_name == "under":
                             info["under_odds"] = price
 
+                    # Find the main line by calculating the tightest odds spread (juice)
+                    main_lines = {}
                     for (player_name, threshold), odds_info in grouped.items():
+                        over = odds_info["over_odds"]
+                        under = odds_info["under_odds"]
+
+                        if over is not None and under is not None:
+                            o_prob = 100 / (over + 100) if over > 0 else abs(over) / (abs(over) + 100)
+                            u_prob = 100 / (under + 100) if under > 0 else abs(under) / (abs(under) + 100)
+                            imbalance = abs(o_prob - u_prob)
+                        else:
+                            imbalance = 999.0
+
+                        if player_name not in main_lines or imbalance < main_lines[player_name][2]:
+                            main_lines[player_name] = (threshold, odds_info, imbalance)
+
+                    for player_name, (threshold, odds_info, imbalance) in main_lines.items():
+                        # STRICT RULE: Drop one-way markets (alt-lines) entirely
+                        if imbalance == 999.0:
+                            continue
+
                         player_id = matcher.match_player_id(player_name)
                         if player_id is None:
                             continue
-
                         try:
                             line = PropLine(
                                 player_id=player_id,
@@ -198,10 +217,9 @@ class OddsApiIngestor(ProviderIngestor):
                                 over_odds=odds_info["over_odds"],
                                 under_odds=odds_info["under_odds"],
                             )
+                            lines.append(line)
                         except ValueError:
                             continue
-
-                        lines.append(line)
 
         return lines
 

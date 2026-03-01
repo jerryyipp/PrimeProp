@@ -65,6 +65,7 @@ async def main() -> None:
                 params={
                     "apiKey": api_key,
                     "regions": "us",
+                    "bookmakers": "fanduel,draftkings,betmgm",
                     "markets": "player_points,player_rebounds,player_assists",
                     "oddsFormat": "american",
                 },
@@ -118,7 +119,7 @@ async def main() -> None:
 
     print("\nTop 5 PRE-GAME +EV bets:")
     for i, edge in enumerate(ranked[:5], 1):
-        pct = edge.edge * 100
+        pct = abs(edge.edge) * 100
         print(
             f"  {i}. {edge.player_id} | {edge.stat_type} {edge.recommended_side} {edge.market_line} | "
             f"Projected: {edge.projected} | Edge: {pct:.2f}% | {edge.provider}"

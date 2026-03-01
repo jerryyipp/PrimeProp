@@ -84,6 +84,11 @@ def rank_props_by_edge(
             # Skip malformed or invalid lines (e.g. non-positive thresholds).
             continue
 
+        # STRICT SANITY CAP: Drop any edge > 40% or < -40%.
+        # These are statistically impossible in a sharp market and represent injury traps or backup rotations.
+        if abs(edge_value) > 0.40:
+            continue
+
         if edge_value > 0.05:
             recommended_side = 'Over'
         elif edge_value < -0.05:
@@ -103,6 +108,7 @@ def rank_props_by_edge(
             )
         )
 
-    ranked.sort(key=lambda item: item.edge, reverse=True)
+    # Sort by the absolute magnitude of the edge to rank both top Overs and Unders
+    ranked.sort(key=lambda item: abs(item.edge), reverse=True)
     return ranked
 
