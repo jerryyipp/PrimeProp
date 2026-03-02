@@ -6,6 +6,38 @@ Below are additional directions beyond configurable N/method and filter-by-strat
 Each can be implemented incrementally.
 
 --------------------------------------------------------------------------------
+CURRENT STATE (AS OF LATEST CODE)
+--------------------------------------------------------------------------------
+
+  Ingest (ingest.py):
+    - Odds API restricted to bookmakers: fanduel, draftkings, betmgm.
+    - Main-line selection per player: tightest juice (smallest over/under imbalance)
+      chosen; alt-lines (other thresholds) dropped.
+    - One-way markets dropped: lines with imbalance == 999.0 (missing over or under)
+      are skipped so they don't block Unders.
+    - FuzzyNameMatcher score_cutoff = 95 to avoid merging different players.
+
+  Projection (projection.py, stats.py):
+    - Single point estimate only: weighted_average or simple_average over last N
+      games (main.py uses N=10, weighted_average only).
+    - Stats from nba_api with 24-hour file cache; no opponent, pace, or home/away.
+    - Markets requested: player_points, player_rebounds, player_assists only
+      (PRA and Threes are in STAT_TYPE_KEY_MAP but not in the Odds API markets
+      param in main.py).
+
+  Optimizer (optimizer.py):
+    - Edge = (projected - market_line) / market_line.
+    - Over/Under/Pass by 5% edge threshold; sort by |edge| so strong Unders rank
+      with strong Overs; display uses abs(edge) for percentage.
+    - Sanity cap: |edge| > 40% skipped (injury/backup noise).
+    - over_odds/under_odds are on PropLine but NOT used for true EV (no
+      probability-based EV yet).
+
+  Database (database.py):
+    - Picks logged with market_line, projected, edge, recommended_side;
+      actual_result and won remain NULL until graded (no auto-grading).
+
+--------------------------------------------------------------------------------
 1. RICHER PROJECTIONS (ACCURACY)
 --------------------------------------------------------------------------------
 
@@ -59,8 +91,9 @@ Each can be implemented incrementally.
 
 2.1 Probability-based EV
 
-  - Today: Edge = (projected - line) / line; PropLine in src/models.py has
-    over_odds / under_odds but they are not used in src/optimizer.py.
+  - Today: Edge = (projected - line) / line; PropLine has over_odds/under_odds
+    but rank_props_by_edge does not use them. calculate_implied_probability
+    exists in optimizer.py but is unused.
   - Add: From projection (and optionally std), compute model-implied P(Over).
     Then EV_over = P(Over) * profit_if_over + (1 - P(Over)) * (-1) (per unit
     stake) using calculate_implied_probability and American-to-decimal payout.
@@ -96,7 +129,7 @@ Each can be implemented incrementally.
 
   - Idea: If we output "P(Over) = 0.62," we want 62% of those to actually go
     over in the long run.
-  - Add: Over graded picks, group by binned model P(Over) (e.g. 0.5-0.55,
+  - Add: Over graded picks, group by binned model P(Over) (e.g. 0.5-0.55,x 
     0.55-0.6, ...) and compare to actual hit rate. If biased (e.g. we say 60%
     but hit 52%), apply a recalibration (e.g. Platt scaling or simple linear
     correction) to P(Over) before computing EV. Improves long-run accuracy of
@@ -117,8 +150,10 @@ Each can be implemented incrementally.
 
 4.1 Best odds per side
 
-  - Today: Ingest can aggregate multiple bookmakers in one snapshot; ranking
-    doesn't distinguish which book offers which line.
+  - Today: We restrict to fanduel, draftkings, betmgm and pick one main line
+    per (player, stat_type) by juice. We still emit one PropLine per
+    (player, stat_type, provider); ranking doesn't pick the best odds across
+    books for over vs under.
   - Add: When multiple providers have the same (player, stat_type, threshold),
     surface best over_odds and best under_odds (and which book). Rank/sort by
     best available EV per prop so "filter by EV" uses the best odds the user
@@ -187,6 +222,42 @@ Each can be implemented incrementally.
   - Differentiation: Ensemble (1.4); line movement (4.2); optional ML (5.1)
     and auto-grading (5.2).
   - Polish: Regression to mean (1.3); Kelly suggestion (2.2); CLV (3.3).
+
+--------------------------------------------------------------------------------
+8. QUICK WINS FROM CURRENT CODE (ACCURACY)
+--------------------------------------------------------------------------------
+
+  These improvements are directly suggested by the current implementation and
+  require minimal structural change:
+
+  8.1 Add PRA and Threes to Odds API markets
+    - Today: main.py requests only "player_points,player_rebounds,player_assists".
+    - Change: Add "player_points_rebounds_assists,player_threes" to the markets
+      param if your Odds API tier and books support them. STAT_TYPE_KEY_MAP and
+      projection/stats already support PRA and Threes; this only expands the
+      props you ingest and rank.
+
+  8.2 Configurable n_games and projection method
+    - Today: main.py hardcodes n_games=10 and method="weighted_average".
+    - Add: Env vars (e.g. PROJECTION_N_GAMES, PROJECTION_METHOD) or CLI args
+      so you can test 5 vs 10 vs 15 games and weighted vs simple without
+      code changes. Enables simple A/B testing and tuning.
+
+  8.3 Minimum sample size for projections
+    - Today: get_projection uses whatever historical_values are available (even
+      one game) and returns 0.0 only when empty.
+    - Add: In main.py, skip building a projection (or treat as "no projection")
+      when len(values) < k (e.g. 5). Avoids ranking props on 1–2 games after
+      return from injury or small sample noise. Reduces false edges.
+
+  8.4 Use odds in optimizer for true EV (high impact)
+    - Today: rank_props_by_edge ignores line.over_odds and line.under_odds;
+      ranking is by edge magnitude only.
+    - Add: Compute model P(Over) from projection (and optionally std from 1.1);
+      then EV_over = P(Over)*decimal_profit_over + (1-P(Over))*(-1) using
+      calculate_implied_probability. Rank or filter by true EV so props with
+      better odds for the same edge rank higher; reduces confusion when same
+      prop appears at different books with different juice.
 
 You can adopt these in any order; the codebase is already structured so
 projection providers, optimizer outputs, and DB can be extended without

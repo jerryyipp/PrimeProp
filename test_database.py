@@ -8,7 +8,7 @@ def main():
     print("Logging simulated pre-game picks...")
     # Simulate the script finding good bets
     db.log_pick("LeBron James", "Points", 25.5, 28.0, 0.12, "Over")
-    db.log_pick("Stephen Curry", "Threes", 4.5, 3.0, -0.25, "Under")
+    db.log_pick("Stephen Curry", "Assists", 4.5, 3.0, -0.25, "Under")
     db.log_pick("Nikola Jokic", "Rebounds", 12.5, 14.1, 0.08, "Over")
 
     print("Simulating next-day results update...")

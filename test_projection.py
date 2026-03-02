@@ -1,15 +1,12 @@
-from src.projection import get_projection
-
 import os
 import sys
 
 # Ensure the src package is importable when running this script directly.
-CURRENT_DIR = os.path.dirname(__file__)
-SRC_DIR = os.path.join(CURRENT_DIR, "src")
-if SRC_DIR not in sys.path:
-    sys.path.append(SRC_DIR)
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+if CURRENT_DIR not in sys.path:
+    sys.path.insert(0, CURRENT_DIR)
 
-from projection import StatType, get_projection
+from src.projection import StatType, get_projection
 
 
 def main() -> None:

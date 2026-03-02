@@ -28,21 +28,31 @@ def format_alert(
     """
     Format a single high-value prop as an alert message.
 
-    Includes: Player Name (or player_id), Prop Line (stat type, line, side),
-    and Confidence Score.
+    Display: line, mean±stdev, p_model, best_ev, side, odds, book.
     """
     name = player_name if player_name is not None else prop_edge.player_id
-    score = confidence_score(prop_edge.edge)
-    line_desc = (
-        f"{prop_edge.stat_type} {prop_edge.recommended_side} {prop_edge.market_line}"
-    )
+    line_val = prop_edge.market_line
+    mean_s = f"{prop_edge.projected:.1f}"
+    if prop_edge.projected_stdev is not None:
+        mean_s += f" ± {prop_edge.projected_stdev:.1f}"
+    p_model = None
+    if prop_edge.recommended_side == "Over" and prop_edge.p_over_model is not None:
+        p_model = prop_edge.p_over_model
+    elif prop_edge.recommended_side == "Under" and prop_edge.p_under_model is not None:
+        p_model = prop_edge.p_under_model
+    p_str = f"P(model)={p_model:.2f}" if p_model is not None else "P(model)=—"
+    ev_str = f"best_ev={prop_edge.best_ev * 100:.2f}%" if prop_edge.best_ev is not None else "best_ev=—"
+    side_str = prop_edge.recommended_side
+    odds_str = f"{prop_edge.recommended_odds:+.0f}" if prop_edge.recommended_odds is not None else "—"
+    book_str = prop_edge.recommended_provider or prop_edge.provider or "—"
+
     return (
         f"**High-value prop**\n"
         f"Player: {name}\n"
-        f"Prop: {line_desc}\n"
-        f"Projected: {prop_edge.projected} | Line: {prop_edge.market_line}\n"
-        f"Confidence Score: {score}%\n"
-        f"Provider: {prop_edge.provider}"
+        f"Line: {prop_edge.stat_type} {line_val}\n"
+        f"Mean±stdev: {mean_s}\n"
+        f"{p_str} | {ev_str}\n"
+        f"Side: {side_str} | Odds: {odds_str} | Book: {book_str}"
     )
 
 
@@ -90,17 +100,17 @@ def alert_high_value_props(
     ranked_edges: List[PropEdge],
     *,
     min_edge: float = 0.05,
+    min_ev: float = 0.05,
     player_names: Optional[Dict[str, str]] = None,
     telegram_bot_token: Optional[str] = None,
     telegram_chat_id: Optional[str] = None,
     discord_webhook_url: Optional[str] = None,
 ) -> List[PropEdge]:
     """
-    Send notifications for every prop with |edge| > min_edge (default 5%).
+    Send notifications for props with positive EV or edge above threshold.
 
-    Alerts on both profitable Overs (edge > 0.05) and profitable Unders
-    (edge < -0.05); negative edge means the model projects under the line,
-    so the Under is the recommended side.
+    When best_ev is available, filter by best_ev >= min_ev (default 5%).
+    Otherwise fall back to |edge| > min_edge.
 
     Uses TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID and/or DISCORD_WEBHOOK_URL
     from the environment if not passed. Returns the list of props that
@@ -110,7 +120,12 @@ def alert_high_value_props(
     chat_id = telegram_chat_id or os.environ.get("TELEGRAM_CHAT_ID")
     webhook = discord_webhook_url or os.environ.get("DISCORD_WEBHOOK_URL")
 
-    high_value = [e for e in ranked_edges if abs(e.edge) > min_edge]
+    def above_threshold(e: PropEdge) -> bool:
+        if e.best_ev is not None:
+            return e.best_ev >= min_ev
+        return abs(e.edge) >= min_edge
+
+    high_value = [e for e in ranked_edges if above_threshold(e)]
     names = player_names or {}
 
     for prop_edge in high_value:

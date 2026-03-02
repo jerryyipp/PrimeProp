@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import re
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -6,6 +8,14 @@ import aiohttp
 from thefuzz import process
 
 from .models import MarketSnapshot, Player, PropLine
+from .projection import STAT_TYPES as ALLOWED_STAT_TYPES
+
+
+def _stable_id(canonical_name: str) -> str:
+    """Stable internal id: slug of canonical_name + short hash (deterministic)."""
+    slug = re.sub(r"[^a-z0-9]+", "_", canonical_name.lower()).strip("_") or "player"
+    h = hashlib.sha256(canonical_name.encode("utf-8")).hexdigest()[:8]
+    return f"{slug}_{h}"
 
 
 # Maps provider-specific market keys into the canonical stat type labels used by PropLine.
@@ -19,67 +29,87 @@ STAT_TYPE_KEY_MAP: Dict[str, str] = {
 
 
 # Resolves noisy provider player names to canonical Player IDs using fuzzy string matching.
+# Uses Player.canonical_name and Player.aliases only (no standardized_name).
 # Learns new players on the fly when it encounters names that are not in the initial list.
 class FuzzyNameMatcher:
-    def __init__(self, players: Iterable[Player], score_cutoff: int = 95) -> None:
+    def __init__(
+        self,
+        players: Iterable[Player],
+        score_cutoff: int = 95,
+        *,
+        counters: Optional[Dict[str, int]] = None,
+    ) -> None:
         self._score_cutoff = score_cutoff
-        # Maps any known name/alias to a canonical Player.id
+        self._counters = counters  # Optional mutable dict for duplicate_player_alias_added, etc.
+        # Maps canonical_name + aliases (and learned raw names) to Player.id
         self._name_to_player_id: Dict[str, str] = {}
         # Tracks Player objects by their id (including dynamically discovered ones)
         self._players_by_id: Dict[str, Player] = {}
 
         for player in players:
             self._players_by_id[player.id] = player
-            self._name_to_player_id[player.standardized_name] = player.id
+            self._name_to_player_id[player.canonical_name] = player.id
             for alias in player.aliases:
                 self._name_to_player_id[alias] = player.id
 
-        self._choices: List[str] = list(self._name_to_player_id.keys())
+        self._choices = list(self._name_to_player_id.keys())
 
-    def _create_player_from_name(self, name: str) -> Player:
+    def _create_player_from_name(self, raw_provider_name: str) -> Player:
         """
-        Create a new Player for a previously unseen name.
+        Create a new Player for a previously unseen name (no match cleared cutoff).
+        id = stable slug+hash of name; provider_name = raw; canonical_name = raw initially.
+        """
+        provider_name = raw_provider_name
+        canonical_name = provider_name
+        player_id = _stable_id(canonical_name)
 
-        Since we don't have team context here, we default team to 'UNK'.
-        """
-        player_id = name
-        # Very rare, but avoid collisions if the exact same id already exists.
         if player_id in self._players_by_id:
-            suffix = 2
-            base = player_id
-            while f"{base} ({suffix})" in self._players_by_id:
-                suffix += 1
-            player_id = f"{base} ({suffix})"
+            self._name_to_player_id[raw_provider_name] = player_id
+            return self._players_by_id[player_id]
 
         player = Player(
             id=player_id,
-            standardized_name=name,
+            provider_name=provider_name,
+            canonical_name=canonical_name,
+            nba_player_id=None,
             team="UNK",
             aliases=[],
         )
         self._players_by_id[player.id] = player
-        self._name_to_player_id[name] = player.id
+        self._name_to_player_id[raw_provider_name] = player.id
         self._choices = list(self._name_to_player_id.keys())
         return player
 
-    # Returns the best-matching Player.id for a provider-supplied name.
-    # If no match clears the cutoff (or there are no known players yet),
-    # a new Player is created dynamically.
-    def match_player_id(self, name: str) -> Optional[str]:
-        if not name:
+    def match_player_id(self, raw_provider_name: str) -> Optional[str]:
+        """
+        Returns the best-matching Player.id for a provider-supplied name.
+        Matches against canonical_name and aliases only. If no match clears cutoff,
+        dynamically creates a new Player (canonical_name = raw initially) and returns its id.
+        """
+        if not raw_provider_name:
             return None
 
-        # If we have no known names yet, learn this player immediately.
         if not self._choices:
-            return self._create_player_from_name(name).id
+            return self._create_player_from_name(raw_provider_name).id
 
-        match = process.extractOne(name, self._choices, score_cutoff=self._score_cutoff)
+        match = process.extractOne(
+            raw_provider_name, self._choices, score_cutoff=self._score_cutoff
+        )
         if match is None:
-            # Below cutoff or no close match: treat as new player
-            return self._create_player_from_name(name).id
+            return self._create_player_from_name(raw_provider_name).id
 
         matched_name = match[0]
-        return self._name_to_player_id.get(matched_name)
+        existing_id = self._name_to_player_id.get(matched_name)
+        if existing_id is None:
+            return self._create_player_from_name(raw_provider_name).id
+        if raw_provider_name not in self._name_to_player_id and self._counters is not None:
+            self._counters["duplicate_player_alias_added"] = self._counters.get("duplicate_player_alias_added", 0) + 1
+        self._name_to_player_id[raw_provider_name] = existing_id
+        return existing_id
+
+    def get_players_by_id(self) -> Dict[str, Player]:
+        """Return all known players keyed by stable id (for resolution and display)."""
+        return dict(self._players_by_id)
 
 
 # Common interface for all upstream data sources that can emit normalized PropLine objects.
@@ -147,6 +177,8 @@ class OddsApiIngestor(ProviderIngestor):
             events = []
 
         for event in events:
+            home_team = event.get("home_team")
+            away_team = event.get("away_team")
             bookmakers = event.get("bookmakers", [])
             for bookmaker in bookmakers:
                 provider_label = bookmaker.get("title") or self.provider_name
@@ -154,7 +186,7 @@ class OddsApiIngestor(ProviderIngestor):
                 for market in markets:
                     market_key = market.get("key")
                     stat_type = STAT_TYPE_KEY_MAP.get(market_key)
-                    if stat_type is None:
+                    if stat_type is None or stat_type not in ALLOWED_STAT_TYPES:
                         continue
 
                     outcomes = market.get("outcomes", [])
@@ -216,6 +248,8 @@ class OddsApiIngestor(ProviderIngestor):
                                 threshold=threshold,
                                 over_odds=odds_info["over_odds"],
                                 under_odds=odds_info["under_odds"],
+                                home_team=home_team,
+                                away_team=away_team,
                             )
                             lines.append(line)
                         except ValueError:
@@ -275,7 +309,7 @@ class PrizePicksIngestor(ProviderIngestor):
 
             stat_key = str(stat_raw).lower()
             stat_type = STAT_TYPE_NAME_MAP.get(stat_key)
-            if stat_type is None:
+            if stat_type is None or stat_type not in ALLOWED_STAT_TYPES:
                 continue
 
             line_score = attributes.get("line_score")
@@ -309,13 +343,15 @@ class PrizePicksIngestor(ProviderIngestor):
 
 
 # Orchestrates concurrent ingestion from multiple providers into a single MarketSnapshot.
+# Returns (snapshot, players_by_id, counters). Counters may include duplicate_player_alias_added.
 async def fetch_multi_source_snapshot(
     snapshot_id: str,
     game_id: str,
     players: List[Player],
     providers: List[ProviderIngestor],
-) -> MarketSnapshot:
-    matcher = FuzzyNameMatcher(players)
+) -> Tuple[MarketSnapshot, Dict[str, Player], Dict[str, int]]:
+    counters: Dict[str, int] = {}
+    matcher = FuzzyNameMatcher(players, counters=counters)
 
     async with aiohttp.ClientSession() as session:
         results = await asyncio.gather(
@@ -329,9 +365,85 @@ async def fetch_multi_source_snapshot(
             continue
         all_lines.extend(result)
 
-    return MarketSnapshot(
+    snapshot = MarketSnapshot(
         snapshot_id=snapshot_id,
         game_id=game_id,
         lines=all_lines,
+    )
+    return snapshot, matcher.get_players_by_id(), counters
+
+
+def _profit_per_unit_american(odds: Optional[float]) -> float:
+    """Profit per $1 stake if bet wins (American odds). Returns -1 if odds is None (worst case)."""
+    if odds is None:
+        return -1.0
+    if odds < 0:
+        return 100.0 / abs(odds)
+    return odds / 100.0
+
+
+# Stat types for which we aggregate multiple books (PTS/REB/AST and optionally others).
+AGGREGATE_STAT_TYPES = ("Points", "Rebounds", "Assists")
+
+
+def aggregate_snapshot_by_best_odds(
+    snapshot: MarketSnapshot,
+    stat_types: Optional[Tuple[str, ...]] = None,
+) -> MarketSnapshot:
+    """
+    Group PropLines by (player_id, stat_type, line). For each group compute
+    best_over_odds + over_provider and best_under_odds + under_provider across books;
+    output one aggregated PropLine per group. If stat_types is set (e.g. PTS/REB/AST),
+    only lines with that stat_type are included in the result; otherwise all.
+    """
+    key_type = Tuple[str, str, float]  # (player_id, stat_type, threshold)
+    allowed = set(stat_types) if stat_types is not None else None
+    grouped: Dict[key_type, List[PropLine]] = {}
+
+    for line in snapshot.lines:
+        if allowed is not None and line.stat_type not in allowed:
+            continue
+        key: key_type = (line.player_id, line.stat_type, line.threshold)
+        grouped.setdefault(key, []).append(line)
+
+    aggregated_lines: List[PropLine] = []
+    for (player_id, stat_type, threshold), lines in grouped.items():
+        best_over = max(
+            (l for l in lines if l.over_odds is not None),
+            key=lambda l: _profit_per_unit_american(l.over_odds),
+            default=None,
+        )
+        best_under = max(
+            (l for l in lines if l.under_odds is not None),
+            key=lambda l: _profit_per_unit_american(l.under_odds),
+            default=None,
+        )
+        over_odds = best_over.over_odds if best_over else None
+        under_odds = best_under.under_odds if best_under else None
+        over_provider = best_over.provider if best_over else None
+        under_provider = best_under.provider if best_under else None
+        primary = over_provider or under_provider or (lines[0].provider if lines else "aggregated")
+
+        first = lines[0]
+        aggregated_lines.append(
+            PropLine(
+                player_id=player_id,
+                provider=primary,
+                stat_type=stat_type,
+                threshold=threshold,
+                over_odds=over_odds,
+                under_odds=under_odds,
+                over_provider=over_provider,
+                under_provider=under_provider,
+                home_team=getattr(first, "home_team", None),
+                away_team=getattr(first, "away_team", None),
+            )
+        )
+
+    return MarketSnapshot(
+        snapshot_id=snapshot.snapshot_id,
+        timestamp=snapshot.timestamp,
+        game_id=snapshot.game_id,
+        lines=aggregated_lines,
     )
 

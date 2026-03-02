@@ -209,3 +209,7 @@ __marimo__/
 
 # Local Cache
 stats_cache.json
+nba_player_id_cache.json
+team_metrics_cache.json
+calibration_params.json
+game_result_cache.json

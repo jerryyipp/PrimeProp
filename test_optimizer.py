@@ -42,7 +42,7 @@ def main() -> None:
             PropLine(
                 player_id="curry",
                 provider="TestBook",
-                stat_type="Threes",
+                stat_type="Assists",
                 threshold=5.0,
             ),
             PropLine(

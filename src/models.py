@@ -5,20 +5,26 @@ from pydantic import BaseModel, Field, field_validator
 
 
 class Player(BaseModel):
-    id: str = Field(..., description="Unique internal identifier")
-    standardized_name: str = Field(..., description="Canonical name")
-    team: str = Field(..., min_length=2, max_length=3)
+    """Canonical NBA player identity. id is a stable slug+hash; use canonical_name for display."""
+    id: str = Field(..., description="Stable internal id (slug + short hash of canonical_name)")
+    provider_name: str = Field(..., description="Raw name from provider (e.g. Odds API)")
+    canonical_name: str = Field(..., description="Best matched canonical display name")
+    nba_player_id: Optional[int] = Field(None, description="NBA.com player id when resolved")
+    team: str = Field(default="UNK", min_length=2, max_length=3)
     aliases: List[str] = Field(default_factory=list)
 
 
 class PropLine(BaseModel):
     player_id: str = Field(...)
-    provider: str = Field(...)
-    # Restricts stat types to a shared, canonical set understood across all providers.
+    provider: str = Field(..., description="Primary provider; use over_provider/under_provider when aggregated")
     stat_type: Literal["Points", "Rebounds", "Assists", "PRA", "Threes"] = Field(...)
     threshold: float = Field(..., gt=0)
     over_odds: Optional[float] = Field(None)
     under_odds: Optional[float] = Field(None)
+    over_provider: Optional[str] = Field(None, description="Book offering best over odds (when aggregated)")
+    under_provider: Optional[str] = Field(None, description="Book offering best under odds (when aggregated)")
+    home_team: Optional[str] = Field(None, description="Event home team (from Odds API)")
+    away_team: Optional[str] = Field(None, description="Event away team (from Odds API)")
 
     # Enforces the domain rule that all prop thresholds must be strictly positive.
     @field_validator("threshold")

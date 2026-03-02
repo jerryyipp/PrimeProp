@@ -39,7 +39,7 @@ def main() -> None:
         game_id="game-1",
         lines=[
             PropLine(player_id="lebron", provider="TestBook", stat_type="Points", threshold=25.0),
-            PropLine(player_id="curry", provider="TestBook", stat_type="Threes", threshold=5.0),
+            PropLine(player_id="curry", provider="TestBook", stat_type="Assists", threshold=5.0),
             PropLine(player_id="jokic", provider="TestBook", stat_type="Rebounds", threshold=12.0),
         ],
     )

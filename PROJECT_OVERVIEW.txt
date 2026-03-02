@@ -13,9 +13,11 @@ improved later for accuracy, robustness, and features.
 1.1  src/models.py — Core data models (Pydantic)
 
   • Player
-    - id: internal identifier
-    - standardized_name: canonical name
-    - team: 2–3 letter code
+    - id: stable internal identifier (slug + short hash)
+    - provider_name: raw name from provider (e.g. Odds API)
+    - canonical_name: display / matching name (initially = provider_name for new players)
+    - nba_player_id: optional when resolved
+    - team: 2–3 letter code (default UNK)
     - aliases: list of alternate names (e.g. "Steph Curry" for Stephen Curry)
 
   • PropLine
@@ -34,7 +36,7 @@ improved later for accuracy, robustness, and features.
 1.2  src/ingest.py — Multi-source data ingestor (async)
 
   • FuzzyNameMatcher
-    - Built from a list of Player objects (standardized_name + aliases).
+    - Built from a list of Player objects (canonical_name + aliases for matching).
     - match_player_id(name): uses fuzzy string matching (e.g. thefuzz) to map
       a provider’s player name to a canonical Player id. Used to link
       "Steph Curry" / "Stephen Curry" across books.
