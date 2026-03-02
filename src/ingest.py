@@ -8,7 +8,9 @@ import aiohttp
 from thefuzz import process
 
 from .models import MarketSnapshot, Player, PropLine
-from .projection import STAT_TYPES as ALLOWED_STAT_TYPES
+
+# PropLine only accepts Points/Rebounds/Assists; filter to these when building lines.
+ALLOWED_STAT_TYPES = ("Points", "Rebounds", "Assists")
 
 
 def _stable_id(canonical_name: str) -> str:
@@ -29,8 +31,7 @@ STAT_TYPE_KEY_MAP: Dict[str, str] = {
 
 
 # Resolves noisy provider player names to canonical Player IDs using fuzzy string matching.
-# Uses Player.canonical_name and Player.aliases only (no standardized_name).
-# Learns new players on the fly when it encounters names that are not in the initial list.
+# Matches against Player.canonical_name and Player.aliases. Learns new players on the fly.
 class FuzzyNameMatcher:
     def __init__(
         self,
@@ -57,7 +58,8 @@ class FuzzyNameMatcher:
     def _create_player_from_name(self, raw_provider_name: str) -> Player:
         """
         Create a new Player for a previously unseen name (no match cleared cutoff).
-        id = stable slug+hash of name; provider_name = raw; canonical_name = raw initially.
+        provider_name = raw provider string; canonical_name = raw initially; nba_player_id = None.
+        id = stable slug(canonical_name) + deterministic short hash. No collision suffix.
         """
         provider_name = raw_provider_name
         canonical_name = provider_name

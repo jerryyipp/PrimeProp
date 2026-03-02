@@ -21,7 +21,7 @@ from src.ingest import (
 from src.optimizer import rank_props_by_edge, load_calibration, DEFAULT_CALIBRATION_PATH
 from src.projection import (
     StatType,
-    get_projection_result,
+    get_projection_result as compute_projection_result,
     blend_short_long_result,
     ensemble_projection,
     ProjectionResult,
@@ -300,7 +300,7 @@ async def main() -> None:
                     min_games=min_games_for_projection,
                 )
             else:
-                result = get_projection_result(
+                result = compute_projection_result(
                     player_id=player_id,
                     stat_type=stat_type,
                     historical_values=values,
@@ -388,7 +388,7 @@ async def main() -> None:
         r = projections.get((player_id, stat_type))
         return r.mean if r is not None else None
 
-    def get_projection_result(player_id: str, stat_type: StatType) -> ProjectionResult | None:
+    def lookup_projection_result(player_id: str, stat_type: StatType) -> ProjectionResult | None:
         return projections.get((player_id, stat_type))
 
     # Optional probability calibration: load from calibration_params.json (project root); apply only for EV; store raw p_over_model
@@ -401,13 +401,13 @@ async def main() -> None:
     ranked = rank_props_by_edge(
         snapshot,
         projection_provider,
-        get_projection_result=get_projection_result,
+        get_projection_result=lookup_projection_result,
         calibration_params=calibration_params,
         ev_threshold=ev_threshold,
     )
 
-    print("\nTop 5 PRE-GAME +EV bets (ranked by best_ev):")
-    for i, edge in enumerate(ranked[:5], 1):
+    print("\nTop 10 PRE-GAME +EV bets (ranked by best_ev):")
+    for i, edge in enumerate(ranked[:10], 1):
         name = id_to_canonical.get(edge.player_id, edge.player_id)
         proj_s = f"{edge.projected:.1f}"
         if edge.projected_stdev is not None:

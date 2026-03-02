@@ -2,9 +2,14 @@
 Historical stats client and simple 24-hour cache for player game logs.
 Uses the official nba_api package to fetch the last N games directly from NBA.com.
 Results are cached on disk for 24 hours to avoid repeatedly hitting the API.
-Supports canonical player identity: resolve_nba_player_id(canonical_name) with
-in-memory + disk cache; fetch prefers nba_player_id when available.
+
+Main.py contract:
+  - resolve_nba_player_id(canonical_name: str) -> Optional[int]
+  - async fetch_last_n_games(nba_player_id: int, n: int) -> list[dict]  # GAME_DATE, PTS, REB, AST
+  - get_stat_series(games: list[dict], stat_type: str) -> list[float]   # Points, Rebounds, Assists
 """
+
+__all__ = ["resolve_nba_player_id", "fetch_last_n_games", "get_stat_series"]
 
 import asyncio
 import json
@@ -136,7 +141,7 @@ def _set_cached_gamelog(nba_player_id: int, n: int, games: List[Dict]) -> None:
 
 
 def _fetch_gamelog_sync(nba_player_id: int, n: int) -> List[Dict]:
-    """Fetch last n games from nba_api; return list of dicts with GAME_DATE, PTS, REB, AST, FG3M."""
+    """Fetch last n games from nba_api; return list of dicts with GAME_DATE, PTS, REB, AST."""
     try:
         log = playergamelog.PlayerGameLog(player_id=nba_player_id)
         df = log.get_data_frames()[0]
@@ -144,7 +149,7 @@ def _fetch_gamelog_sync(nba_player_id: int, n: int) -> List[Dict]:
         return []
     if df is None or df.empty:
         return []
-    df = df.head(n).iloc[::-1]  # oldest -> newest
+    df = df.head(n).iloc[::-1]  # oldest -> newest (chronological order for main.py)
     rows: List[Dict] = []
     for _, row in df.iterrows():
         try:
@@ -154,7 +159,6 @@ def _fetch_gamelog_sync(nba_player_id: int, n: int) -> List[Dict]:
                 "PTS": float(row["PTS"]),
                 "REB": float(row["REB"]),
                 "AST": float(row["AST"]),
-                "FG3M": float(row["FG3M"]),
             })
         except (KeyError, ValueError, TypeError):
             continue
@@ -178,22 +182,19 @@ async def fetch_last_n_games(nba_player_id: int, n: int) -> List[Dict]:
 
 def get_stat_series(games: List[Dict], stat_type: str) -> List[float]:
     """
-    Extract a stat series from gamelog rows. stat_type: 'points'|'rebounds'|'assists'|'PRA'|'Threes'
-    or canonical StatType. Returns list of floats (oldest to newest).
+    Extract a stat series from gamelog rows. Supports only Points, Rebounds, Assists.
+    stat_type: 'Points'|'Rebounds'|'Assists' or lowercase/aliases (points, rebounds, assists, pts, reb, ast).
+    Returns list of floats (oldest to newest).
     """
     if not games:
         return []
     st = (stat_type or "").strip().lower()
     if st in ("points", "pts"):
-        return [g["PTS"] for g in games if "PTS" in g]
+        return [float(g["PTS"]) for g in games if "PTS" in g]
     if st in ("rebounds", "reb"):
-        return [g["REB"] for g in games if "REB" in g]
+        return [float(g["REB"]) for g in games if "REB" in g]
     if st in ("assists", "ast"):
-        return [g["AST"] for g in games if "AST" in g]
-    if st in ("pra",):
-        return [g["PTS"] + g["REB"] + g["AST"] for g in games if all(k in g for k in ("PTS", "REB", "AST"))]
-    if st in ("threes", "fg3m"):
-        return [g["FG3M"] for g in games if "FG3M" in g]
+        return [float(g["AST"]) for g in games if "AST" in g]
     return []
 
 

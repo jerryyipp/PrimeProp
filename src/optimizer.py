@@ -225,14 +225,12 @@ def rank_props_by_edge(
     """
     Returns a ranked list of props with EV-based ranking (best_ev desc, fallback abs(edge)).
 
-    For each PropLine with both over_odds and under_odds and a ProjectionResult (mean, stdev):
-    computes p_over_model via Normal(mean, stdev), then EV_over and EV_under; recommends
-    the side with higher EV only if best_ev > threshold (0.02 when ev_threshold is None), else Pass.
-    Edge is display-only.
-
-    If ev_threshold is not None, filters results before return: keep edges where
-    (best_ev is not None and best_ev >= ev_threshold) or (best_ev is None and edge >= ev_threshold).
-    If ev_threshold is omitted (None), no filtering is applied.
+    Uses rec_threshold = ev_threshold if ev_threshold is not None else 0.02 for recommendation
+    checks (never compare to None). When EV is computed, recommends Over/Under only if
+    best_ev >= rec_threshold; else Pass and recommended_odds/recommended_provider None.
+    When best_ev is positive but below rec_threshold, best_ev is set to None so Pass plays
+    don't rank above real bets. Fallback when EV cannot be computed: edge-based recommendation
+    unchanged. If ev_threshold is not None, filter results at end; otherwise no filter.
 
     Args:
         snapshot: MarketSnapshot containing the available prop lines.
@@ -241,8 +239,8 @@ def rank_props_by_edge(
             P(Over)/EV computation. If None, EV fields are null; fallback to edge-based recommendation.
         calibration_params: Optional (a, b). If set, EV uses p' = clamp(a*p + b, 0, 1)
             for P(Over) before computing EV; PropEdge still stores raw p_over_model.
-        ev_threshold: Optional. If set, filters to edges with best_ev >= ev_threshold (or edge >= ev_threshold
-            when best_ev is None). If None, no filtering; recommendation uses 0.02 internally.
+        ev_threshold: Optional. If set, only recommend when best_ev >= ev_threshold and filter at end.
+            If None, rec_threshold=0.02 and no filtering.
     """
     ranked: List[PropEdge] = []
     rec_threshold = ev_threshold if ev_threshold is not None else 0.02
@@ -296,7 +294,7 @@ def rank_props_by_edge(
                 ev_over_val = ev_per_unit(p_over_ev, profit_over)
                 ev_under_val = ev_per_unit(p_under_ev, profit_under)
                 best_ev_here = max(ev_over_val, ev_under_val)
-                if best_ev_here > rec_threshold:
+                if best_ev_here >= rec_threshold:
                     if ev_over_val >= ev_under_val:
                         recommended_side = 'Over'
                         recommended_odds_val = line.over_odds
@@ -305,6 +303,10 @@ def rank_props_by_edge(
                         recommended_side = 'Under'
                         recommended_odds_val = line.under_odds
                         recommended_provider_val = under_provider_val or line.provider
+                else:
+                    recommended_side = 'Pass'
+                    recommended_odds_val = None
+                    recommended_provider_val = None
         if recommended_side == 'Pass' and (ev_over_val is None or ev_under_val is None):
             # Fallback to edge-based recommendation
             if edge_value > 0.05:
@@ -320,6 +322,8 @@ def rank_props_by_edge(
         if ev_over_val is not None and ev_under_val is not None:
             best_ev_val = max(ev_over_val, ev_under_val)
             if best_ev_val <= 0:
+                best_ev_val = None
+            elif best_ev_val < rec_threshold:
                 best_ev_val = None
 
         ranked.append(
@@ -346,7 +350,6 @@ def rank_props_by_edge(
             )
         )
 
-    # Filter by ev_threshold if set
     if ev_threshold is not None:
         def _passes_filter(item: PropEdge) -> bool:
             if item.best_ev is not None:
@@ -354,13 +357,17 @@ def rank_props_by_edge(
             return item.edge >= ev_threshold
         ranked = [e for e in ranked if _passes_filter(e)]
 
-    # Sort by best_ev descending when available, else by |edge|
+    # Sort: EV items first (higher best_ev ranks higher), then non-EV by |edge|
     def _sort_key(item: PropEdge) -> tuple:
         ev = item.best_ev
         if ev is not None:
-            return (1, -ev)  # best_ev first, higher better
-        return (0, -abs(item.edge))
+            return (0, -ev)  # (0,...) sorts before (1,...); -ev gives higher EV first
+        return (1, -abs(item.edge))
 
     ranked.sort(key=_sort_key)
+    ev_items = [e for e in ranked if e.best_ev is not None]
+    if ev_items:
+        max_ev = max(e.best_ev for e in ev_items)
+        assert ranked[0].best_ev == max_ev, "ranked[0] must be highest best_ev when EV items exist"
     return ranked
 

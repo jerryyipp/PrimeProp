@@ -5,19 +5,19 @@ from pydantic import BaseModel, Field, field_validator
 
 
 class Player(BaseModel):
-    """Canonical NBA player identity. id is a stable slug+hash; use canonical_name for display."""
+    """Canonical NBA player identity. id = stable slug + short hash of canonical_name; use canonical_name for display."""
     id: str = Field(..., description="Stable internal id (slug + short hash of canonical_name)")
     provider_name: str = Field(..., description="Raw name from provider (e.g. Odds API)")
     canonical_name: str = Field(..., description="Best matched canonical display name")
     nba_player_id: Optional[int] = Field(None, description="NBA.com player id when resolved")
     team: str = Field(default="UNK", min_length=2, max_length=3)
-    aliases: List[str] = Field(default_factory=list)
+    aliases: List[str] = Field(default_factory=list, description="Alternate names for matching")
 
 
 class PropLine(BaseModel):
     player_id: str = Field(...)
     provider: str = Field(..., description="Primary provider; use over_provider/under_provider when aggregated")
-    stat_type: Literal["Points", "Rebounds", "Assists", "PRA", "Threes"] = Field(...)
+    stat_type: Literal["Points", "Rebounds", "Assists"] = Field(...)
     threshold: float = Field(..., gt=0)
     over_odds: Optional[float] = Field(None)
     under_odds: Optional[float] = Field(None)
