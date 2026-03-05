@@ -1,13 +1,16 @@
 """
 PrimeProp main entrypoint: fetch PRE-GAME NBA odds from The Odds API,
 run the optimizer, and print/alert the top +EV props.
+
+All ranking logic (projections, minutes filter, context/matchup, EV ranking, Top N) lives here.
 """
-import json
 import os
 import asyncio
 import aiohttp
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
 from dotenv import load_dotenv
 load_dotenv()  # MUST BE LOADED BEFORE SRC MODULES
 
@@ -18,24 +21,324 @@ from src.ingest import (
     aggregate_snapshot_by_best_odds,
     AGGREGATE_STAT_TYPES,
 )
-from src.optimizer import rank_props_by_edge, load_calibration, DEFAULT_CALIBRATION_PATH
+from src.alerting import alert_high_value_props
+from src.models import MarketSnapshot, Player
+from src.optimizer import rank_props_by_edge
 from src.projection import (
-    StatType,
+    ProjectionResult,
     get_projection_result as compute_projection_result,
     blend_short_long_result,
     ensemble_projection,
-    ProjectionResult,
     winsorize,
-)
-from src.alerting import alert_high_value_props
-from src.stats import fetch_last_n_games, get_stat_series, resolve_nba_player_id
-from src.matchup import get_team_metrics, get_league_avg_metrics, get_player_team, normalize_team_to_abbrev
-from src.projection import (
     adjust_for_matchup,
+    apply_context_adjustments,
+    blend_lastN_with_season,
     MATCHUP_METRIC_PTS,
     MATCHUP_METRIC_REB,
     MATCHUP_METRIC_AST,
+    compute_stdev,
 )
+from src.stats import (
+    fetch_last_n_games,
+    get_stat_series,
+    get_rest_days,
+    fetch_season_to_date_avg,
+    resolve_nba_player_id,
+)
+from src.matchup import get_team_metrics, get_league_avg_metrics, get_player_team, normalize_team_to_abbrev
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)).strip())
+    except (ValueError, TypeError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)).strip())
+    except (ValueError, TypeError):
+        return default
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    return os.getenv(name, "").strip().lower() in ("1", "true", "yes")
+
+
+def _enrich_ranked_with_line_movement(
+    ranked: List[Any],
+    open_lines: Optional[Dict[Tuple[str, str], float]],
+) -> List[Any]:
+    """Set open_line, current_line, delta_line on each PropEdge from open_lines. Returns new list."""
+    if not open_lines:
+        return ranked
+    out = []
+    for e in ranked:
+        open_ln = open_lines.get((e.player_id, e.stat_type), e.market_line)
+        cur_ln = e.market_line
+        delta = cur_ln - open_ln
+        out.append(e.model_copy(update={"open_line": open_ln, "current_line": cur_ln, "delta_line": delta}))
+    return out
+
+
+async def run_ranking_for_snapshot(
+    snapshot: MarketSnapshot,
+    players_by_id: Dict[str, Player],
+    *,
+    ingest_counters: Optional[Dict[str, Any]] = None,
+    open_lines: Optional[Dict[Tuple[str, str], float]] = None,
+) -> Tuple[List[Any], Dict[str, str], Dict[str, Optional[int]], Dict[Tuple[str, str], Tuple[float, Optional[ProjectionResult]]]]:
+    """
+    Build projections (with variance inflation via get_projection_result), apply minutes + context + matchup,
+    rank by EV, enrich line movement. Returns (ranked, id_to_canonical, resolved_nba_ids, projected) for main.
+    """
+    if ingest_counters is None:
+        ingest_counters = {}
+
+    # Projection config from env
+    projection_n_games = _env_int("PROJECTION_N_GAMES", 10)
+    min_games_for_projection = _env_int("MIN_GAMES_FOR_PROJECTION", 5)
+    winsorize_pct = _env_float("WINSORIZE_PCT", 0.0)
+    stats_max_concurrency = _env_int("STATS_MAX_CONCURRENCY", 8)
+    projection_method = (os.getenv("PROJECTION_METHOD", "weighted_average") or "weighted_average").strip().lower()
+    if projection_method not in ("weighted_average", "simple_average", "exponential", "blend_short_long"):
+        projection_method = "weighted_average"
+
+    projection_strategy = (os.getenv("PROJECTION_STRATEGY", "single") or "single").strip().lower()
+    blend_enabled = projection_strategy == "blend"
+    short_n = _env_int("SHORT_N", 5)
+    long_n = _env_int("LONG_N", 15)
+    regression_alpha = _env_float("REGRESSION_ALPHA", 0.65)
+    ensemble_enabled = projection_strategy == "ensemble"
+    ensemble_weights_str = (os.getenv("ENSEMBLE_WEIGHTS", "weighted_average:0.6,simple_average:0.4") or "").strip()
+    season_blend_enabled = projection_strategy == "season_blend"
+    season_blend_alpha = _env_float("SEASON_BLEND_ALPHA", 0.7)
+    matchup_enabled = _env_bool("MATCHUP_ENABLED", True)
+    matchup_strength = _env_float("MATCHUP_STRENGTH", 0.5)
+    min_avg_minutes = _env_float("MIN_AVG_MINUTES", 18.0)
+    max_minutes_stdev = _env_float("MAX_MINUTES_STDEV", 6.0)
+    ev_threshold: Optional[float] = None
+    try:
+        ev_str = os.getenv("EV_THRESHOLD", "").strip()
+        if ev_str:
+            ev_threshold = float(ev_str)
+    except (ValueError, TypeError):
+        pass
+
+    # Unique (player_id, stat_type) and id -> canonical name
+    unique_keys = set((line.player_id, line.stat_type) for line in snapshot.lines)
+    id_to_canonical: Dict[str, str] = {}
+    player_to_stat_types: Dict[str, List[str]] = {}
+    for pid, st in unique_keys:
+        if pid not in id_to_canonical:
+            p = players_by_id.get(pid)
+            id_to_canonical[pid] = p.canonical_name if p else pid
+        player_to_stat_types.setdefault(pid, []).append(st)
+
+    skipped_small_sample = 0
+    failed_fetch = 0
+    resolved_nba_ids: Dict[str, Optional[int]] = {}
+    for pid in player_to_stat_types:
+        canonical = id_to_canonical.get(pid, pid)
+        nba_id = resolve_nba_player_id(canonical)
+        resolved_nba_ids[pid] = nba_id
+
+    if hasattr(snapshot, "timestamp") and snapshot.timestamp:
+        ts = snapshot.timestamp
+        target_game_date = ts.date() if isinstance(ts, datetime) else date.today()
+    else:
+        target_game_date = date.today()
+
+    game_context: Dict[str, Any] = {"home_team": None, "away_team": None}
+    for line in snapshot.lines:
+        if line.home_team or line.away_team:
+            game_context["home_team"] = line.home_team
+            game_context["away_team"] = line.away_team
+            break
+
+    league_avg_metrics = get_league_avg_metrics()
+    matchup_metric_map = {"Points": MATCHUP_METRIC_PTS, "Rebounds": MATCHUP_METRIC_REB, "Assists": MATCHUP_METRIC_AST}
+    n_games_fetch = long_n if (blend_enabled or ensemble_enabled) else projection_n_games
+    n_games_fetch = max(n_games_fetch, projection_n_games)
+
+    ensemble_weights_list: List[Tuple[str, float]] = []
+    if ensemble_enabled and ensemble_weights_str:
+        for part in ensemble_weights_str.split(","):
+            part = part.strip()
+            if ":" in part:
+                name, w = part.split(":", 1)
+                try:
+                    ensemble_weights_list.append((name.strip(), float(w.strip())))
+                except (ValueError, TypeError):
+                    pass
+    if not ensemble_weights_list:
+        ensemble_weights_list = [("weighted_average", 0.6), ("simple_average", 0.4)]
+
+    projected: Dict[Tuple[str, str], Tuple[float, Optional[ProjectionResult]]] = {}
+    semaphore = asyncio.Semaphore(stats_max_concurrency)
+
+    async def process_player(player_id: str, stat_types: List[str]) -> None:
+        nonlocal skipped_small_sample, failed_fetch
+        nba_id = resolved_nba_ids.get(player_id)
+        if nba_id is None:
+            failed_fetch += 1
+            return
+        async with semaphore:
+            try:
+                games = await fetch_last_n_games(nba_id, n_games_fetch)
+            except Exception:
+                failed_fetch += 1
+                return
+        if not games:
+            failed_fetch += 1
+            return
+
+        # Pre-filter: most recent game DNP/0 minutes -> skip player
+        last_game = games[-1]
+        last_min = last_game.get("MIN")
+        if not isinstance(last_min, (int, float)) or last_min <= 0:
+            ingest_counters["skipped_recent_dnp"] = ingest_counters.get("skipped_recent_dnp", 0) + 1
+            return
+
+        # Minutes stability filter (MIN_AVG_MINUTES, MAX_MINUTES_STDEV)
+        mins = [g["MIN"] for g in games if "MIN" in g]
+        mins = [m for m in mins if m is not None and isinstance(m, (int, float))]
+        avg_minutes = None
+        minutes_stdev = None
+        if mins:
+            n_min = len(mins)
+            avg_minutes = sum(mins) / n_min
+            if n_min >= 2:
+                minutes_stdev = compute_stdev(mins)
+            else:
+                minutes_stdev = 0.0
+        if avg_minutes is not None and avg_minutes < min_avg_minutes:
+            ingest_counters["skipped_low_minutes"] = ingest_counters.get("skipped_low_minutes", 0) + 1
+            return
+        if minutes_stdev is not None and minutes_stdev > max_minutes_stdev:
+            ingest_counters["skipped_unstable_minutes"] = ingest_counters.get("skipped_unstable_minutes", 0) + 1
+            return
+
+        player_team_abbrev: Optional[str] = None
+        if matchup_enabled:
+            player_team_abbrev = get_player_team(nba_id)
+        opponent_metrics_pts = league_avg_metrics
+        opponent_metrics_reb = league_avg_metrics
+        opponent_metrics_ast = league_avg_metrics
+        if matchup_enabled and game_context.get("home_team") and game_context.get("away_team") and player_team_abbrev:
+            home_abbrev = normalize_team_to_abbrev(game_context["home_team"])
+            away_abbrev = normalize_team_to_abbrev(game_context["away_team"])
+            opponent_abbrev = away_abbrev if player_team_abbrev == home_abbrev else home_abbrev
+            opponent_metrics_pts = get_team_metrics(opponent_abbrev)
+            opponent_metrics_reb = get_team_metrics(opponent_abbrev)
+            opponent_metrics_ast = get_team_metrics(opponent_abbrev)
+
+        rest_days = get_rest_days(games, target_game_date)
+        is_home = None
+        if game_context.get("home_team") and player_team_abbrev:
+            home_abbrev = normalize_team_to_abbrev(game_context["home_team"])
+            is_home = player_team_abbrev == home_abbrev
+
+        for stat_type in stat_types:
+            values = get_stat_series(games, stat_type)
+            if not values:
+                continue
+            if winsorize_pct > 0 and winsorize_pct < 0.5:
+                values, _ = winsorize(values, winsorize_pct)
+
+            if len(values) < min_games_for_projection:
+                skipped_small_sample += 1
+                continue
+
+            result: Optional[ProjectionResult] = None
+            mean_val: float = 0.0
+
+            if blend_enabled:
+                short_vals = values[-short_n:] if len(values) >= short_n else values
+                long_vals = values[-long_n:] if len(values) >= long_n else values
+                res, _ = blend_short_long_result(
+                    short_vals, long_vals, regression_alpha, projection_method,
+                    stat_type=stat_type, min_games=min_games_for_projection,
+                )
+                if res is not None:
+                    result, mean_val = res, res.mean
+            elif ensemble_enabled:
+                values_short = values[-short_n:] if len(values) >= short_n else values
+                values_long = values[-long_n:] if len(values) >= long_n else values
+                res, _ = ensemble_projection(
+                    ensemble_weights_list, values_short, values_long, regression_alpha,
+                    stat_type=stat_type, min_games=min_games_for_projection,
+                )
+                if res is not None:
+                    result, mean_val = res, res.mean
+            elif season_blend_enabled:
+                base_result = compute_projection_result(
+                    player_id, stat_type, values,
+                    n_games=projection_n_games, method=projection_method, min_games=min_games_for_projection,
+                )
+                if base_result is not None:
+                    try:
+                        season_avg = await fetch_season_to_date_avg(nba_id, stat_type)
+                        if season_avg is not None:
+                            result = blend_lastN_with_season(base_result, season_avg, season_blend_alpha)
+                            mean_val = result.mean
+                        else:
+                            result, mean_val = base_result, base_result.mean
+                    except Exception:
+                        result, mean_val = base_result, base_result.mean
+            else:
+                result = compute_projection_result(
+                    player_id, stat_type, values,
+                    n_games=projection_n_games, method=projection_method, min_games=min_games_for_projection,
+                )
+                mean_val = result.mean if result else 0.0
+
+            if result is None:
+                continue
+
+            # Context adjustments (is_home, rest_days)
+            if is_home is not None and rest_days is not None:
+                mean_val = apply_context_adjustments(mean_val, stat_type, is_home, rest_days)
+                result = ProjectionResult(mean=mean_val, stdev=result.stdev, n=result.n, confidence=result.confidence)
+
+            # Matchup
+            if matchup_enabled:
+                metric_key = matchup_metric_map.get(stat_type, MATCHUP_METRIC_PTS)
+                opp = opponent_metrics_pts if stat_type == "Points" else (opponent_metrics_reb if stat_type == "Rebounds" else opponent_metrics_ast)
+                mean_val = adjust_for_matchup(mean_val, opp, league_avg_metrics, matchup_strength, metric_key)
+                result = ProjectionResult(mean=mean_val, stdev=result.stdev, n=result.n, confidence=result.confidence)
+
+            projected[(player_id, stat_type)] = (mean_val, result)
+
+    await asyncio.gather(*(process_player(pid, st_list) for pid, st_list in player_to_stat_types.items()))
+
+    summary_parts = [f"failed_fetch={failed_fetch}", f"skipped_small_sample={skipped_small_sample}"]
+    if ingest_counters.get("skipped_recent_dnp"):
+        summary_parts.append(f"skipped_recent_dnp={ingest_counters['skipped_recent_dnp']}")
+    if ingest_counters.get("skipped_low_minutes"):
+        summary_parts.append(f"skipped_low_minutes={ingest_counters['skipped_low_minutes']}")
+    if ingest_counters.get("skipped_unstable_minutes"):
+        summary_parts.append(f"skipped_unstable_minutes={ingest_counters['skipped_unstable_minutes']}")
+    print("Projection summary: " + ", ".join(summary_parts))
+
+    def get_projection(pid: str, st: str) -> Optional[float]:
+        entry = projected.get((pid, st), (None, None))
+        return entry[0]
+
+    def lookup_projection_result(pid: str, st: str) -> Optional[ProjectionResult]:
+        entry = projected.get((pid, st), (None, None))
+        return entry[1]
+
+    ranked = rank_props_by_edge(
+        snapshot,
+        get_projection,
+        get_projection_result=lookup_projection_result,
+        ev_threshold=ev_threshold,
+    )
+    ranked = _enrich_ranked_with_line_movement(ranked, open_lines)
+
+    return (ranked, id_to_canonical, resolved_nba_ids, projected)
 
 
 async def get_upcoming_event_ids(api_key: str) -> list[str]:
@@ -48,19 +351,12 @@ async def get_upcoming_event_ids(api_key: str) -> list[str]:
     async with aiohttp.ClientSession() as session:
         async with session.get(url, params={"apiKey": api_key}) as resp:
             games = await resp.json()
-
             for game in games:
-                # API returns time like "2024-10-22T23:30:00Z", we make it Python-friendly
                 commence_str = game["commence_time"].replace("Z", "+00:00")
                 commence_time = datetime.fromisoformat(commence_str)
-
-                # Implement a 1:00 AM EST betting-day rollover (UTC-5 ≈ 6-hour shift).
                 game_betting_date = (commence_time - timedelta(hours=6)).date()
-
-                # Only grab games where the tip-off time is in the future AND in today's betting day.
                 if game_betting_date == current_betting_date and commence_time > now:
                     upcoming_ids.append(game["id"])
-
     return upcoming_ids
 
 
@@ -76,7 +372,6 @@ async def main() -> None:
         return
 
     print(f"Found {len(upcoming_event_ids)} upcoming games. Fetching pre-game player props...")
-    # We dynamically create an Ingestor for EVERY upcoming game
     ingestors = []
     for event_id in upcoming_event_ids:
         url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{event_id}/odds"
@@ -93,7 +388,6 @@ async def main() -> None:
             )
         )
 
-    # Pass ALL the ingestors into your beautifully built concurrent snapshot fetcher
     snapshot, players_by_id, ingest_counters = await fetch_multi_source_snapshot(
         snapshot_id="pre-game-1",
         game_id="upcoming_nba_slate",
@@ -102,331 +396,54 @@ async def main() -> None:
     )
     print(f"DEBUG: Total props ingested: {len(snapshot.lines)}")
 
-    # Aggregate by (player_id, stat_type, line); pick best odds per side across books
     snapshot = aggregate_snapshot_by_best_odds(snapshot, stat_types=AGGREGATE_STAT_TYPES)
     print(f"DEBUG: Props after aggregation (PTS/REB/AST): {len(snapshot.lines)}")
 
-    # Projection config from env
+    open_lines: Optional[Dict[Tuple[str, str], float]] = None
+    _db = DatabaseManager()
     try:
-        projection_n_games = int(os.getenv("PROJECTION_N_GAMES", "10").strip())
-    except ValueError:
-        projection_n_games = 10
-    if projection_n_games < 1 or projection_n_games > 100:
-        projection_n_games = 10
-    try:
-        min_games_for_projection = int(os.getenv("MIN_GAMES_FOR_PROJECTION", "5").strip())
-    except ValueError:
-        min_games_for_projection = 5
-    if min_games_for_projection < 1:
-        min_games_for_projection = 5
-    try:
-        winsorize_pct = float(os.getenv("WINSORIZE_PCT", "0.05").strip())
-    except ValueError:
-        winsorize_pct = 0.0
-    if winsorize_pct <= 0 or winsorize_pct >= 0.5:
-        winsorize_pct = 0.0
-    try:
-        stats_max_concurrency = int(os.getenv("STATS_MAX_CONCURRENCY", "5").strip())
-    except ValueError:
-        stats_max_concurrency = 5
-    if stats_max_concurrency < 1:
-        stats_max_concurrency = 5
-    projection_method = (os.getenv("PROJECTION_METHOD", "weighted_average") or "weighted_average").strip()
+        open_lines = _db.get_earliest_snapshot_lines_for_game(snapshot.game_id)
+        if open_lines:
+            print(f"DEBUG: Line movement: using {len(open_lines)} open lines from earliest snapshot today.")
+        if os.getenv("PERSIST_SNAPSHOTS", "0").strip().lower() in ("1", "true", "yes"):
+            pk = _db.save_snapshot(snapshot, players_by_id)
+            print(f"DEBUG: Persisted snapshot id={pk} ({snapshot.snapshot_id}, {len(snapshot.lines)} lines).")
+    finally:
+        _db.close()
 
-    # Regression-to-mean blending (short/long): check BLEND_REGRESSION_TO_MEAN first, fallback to BLEND_REGESSION_TO_MEAN
-    blend_val = os.getenv("BLEND_REGRESSION_TO_MEAN") or os.getenv("BLEND_REGESSION_TO_MEAN") or ""
-    blend_enabled = blend_val.strip().lower() in ("1", "true", "yes")
-    try:
-        short_n = int(os.getenv("SHORT_N", "5").strip())
-    except ValueError:
-        short_n = 5
-    try:
-        long_n = int(os.getenv("LONG_N", "20").strip())
-    except ValueError:
-        long_n = 20
-    try:
-        regression_alpha = float(os.getenv("REGRESSION_ALPHA", "0.65").strip())
-    except ValueError:
-        regression_alpha = 0.65
-    if regression_alpha < 0 or regression_alpha > 1:
-        regression_alpha = 0.65
-
-    # Projection strategy: single vs ensemble
-    projection_strategy = (os.getenv("PROJECTION_STRATEGY", "single") or "single").strip().lower()
-    ensemble_enabled = projection_strategy == "ensemble"
-
-    # Parse ENSEMBLE_WEIGHTS: JSON {"wa": 0.5, ...} or comma "weighted_average:0.5,simple_average:0.2,blend_short_long:0.3"
-    ensemble_weights_raw = (os.getenv("ENSEMBLE_WEIGHTS") or "weighted_average:0.5,simple_average:0.2,blend_short_long:0.3").strip()
-    ensemble_weights_list: list[tuple[str, float]] = []
-    if ensemble_enabled:
-        if ensemble_weights_raw.startswith("{"):
-            try:
-                d = json.loads(ensemble_weights_raw)
-                ensemble_weights_list = [(k, float(v)) for k, v in d.items()]
-            except (json.JSONDecodeError, ValueError):
-                ensemble_weights_list = [("weighted_average", 0.5), ("simple_average", 0.2), ("blend_short_long", 0.3)]
-        else:
-            for part in ensemble_weights_raw.split(","):
-                part = part.strip()
-                if ":" in part:
-                    k, v = part.split(":", 1)
-                    try:
-                        ensemble_weights_list.append((k.strip(), float(v.strip())))
-                    except ValueError:
-                        pass
-        if not ensemble_weights_list:
-            ensemble_weights_list = [("weighted_average", 0.5), ("simple_average", 0.2), ("blend_short_long", 0.3)]
-
-    # Matchup (opponent) adjustment: ENABLE_MATCHUP_ADJUSTMENT default false, MATCHUP_STRENGTH default 0.4
-    matchup_enabled = os.getenv("ENABLE_MATCHUP_ADJUSTMENT", "").strip().lower() in ("1", "true", "yes")
-    try:
-        matchup_strength = float(os.getenv("MATCHUP_STRENGTH", "0.4").strip())
-    except ValueError:
-        matchup_strength = 0.4
-    matchup_strength = max(0.0, min(1.0, matchup_strength))
-    if matchup_enabled:
-        print(f"Projection config: matchup adjustment enabled, strength={matchup_strength}")
-
-    if ensemble_enabled:
-        print(
-            f"Projection config: strategy=ensemble, short_n={short_n}, long_n={long_n}, "
-            f"blend_alpha={regression_alpha}, weights={ensemble_weights_list}, min_games={min_games_for_projection}"
-        )
-    elif blend_enabled:
-        print(
-            f"Projection config: blend_short_long enabled, short_n={short_n}, long_n={long_n}, "
-            f"alpha={regression_alpha}, base_method={projection_method!r}, min_games={min_games_for_projection}"
-        )
-    else:
-        print(
-            f"Projection config: n_games={projection_n_games}, method={projection_method!r}, "
-            f"min_games={min_games_for_projection}, stats_max_concurrency={stats_max_concurrency}"
-        )
-
-    # Build projections: group by player, fetch gamelog once per player, then series per stat type.
-    print("Fetching historical stats and building projections...")
-    projections: dict[tuple[str, StatType], ProjectionResult] = {}
-    unique_keys = {(line.player_id, line.stat_type) for line in snapshot.lines}
-    id_to_canonical = {pid: p.canonical_name for pid, p in players_by_id.items()}
-
-    # Group by player_id -> set of stat_types
-    player_to_stat_types: dict[str, set[StatType]] = {}
-    for (player_id, stat_type) in unique_keys:
-        player_to_stat_types.setdefault(player_id, set()).add(stat_type)
-
-    total_keys = len(unique_keys)
-    skipped_small_sample = 0
-    failed_fetch = 0
-    resolved_nba_id = 0
-    unresolved_player_skips = 0
-    winsorized_count = 0
-    confidence_counts: dict[str, int] = {"insufficient": 0, "low": 0, "high_variance": 0, "ok": 0}
-    strategy_counts: dict[str, int] = {}
-    resolved_nba_ids: dict[str, int] = {}  # player_id -> nba_player_id for DB logging
-    matchup_metric_warned: set[str] = set()  # stat_types we've already printed "metric not present" for
-
-    print(f"DEBUG: Unique (player, stat_type) pairs found: {total_keys}")
-
-    # Build (player_id, stat_type) -> (home_team, away_team) from lines
-    game_context: dict[tuple[str, StatType], tuple[str | None, str | None]] = {}
-    for line in snapshot.lines:
-        key = (line.player_id, line.stat_type)
-        if key not in game_context and (getattr(line, "home_team", None) or getattr(line, "away_team", None)):
-            game_context[key] = (getattr(line, "home_team", None), getattr(line, "away_team", None))
-
-    league_avg_metrics = get_league_avg_metrics() if matchup_enabled else {}
-    n_games_fetch = long_n if (blend_enabled or ensemble_enabled) else projection_n_games
-    semaphore = asyncio.Semaphore(stats_max_concurrency)
-    counters_lock = asyncio.Lock()
-
-    async def process_player(player_id: str, stat_types: set[StatType]) -> None:
-        nonlocal resolved_nba_id, unresolved_player_skips, failed_fetch, skipped_small_sample, winsorized_count, resolved_nba_ids, matchup_metric_warned
-        player = players_by_id.get(player_id)
-        if not player:
-            return
-        nba_id = player.nba_player_id or await asyncio.to_thread(
-            resolve_nba_player_id, player.canonical_name
-        )
-        if nba_id is None:
-            async with counters_lock:
-                unresolved_player_skips += len(stat_types)
-            return
-        async with counters_lock:
-            resolved_nba_id += 1
-            resolved_nba_ids[player_id] = nba_id
-        display_name = player.canonical_name
-        async with semaphore:
-            games = await fetch_last_n_games(nba_id, n_games_fetch)
-        if not games:
-            async with counters_lock:
-                failed_fetch += len(stat_types)
-            return
-        for stat_type in stat_types:
-            values = get_stat_series(games, stat_type)
-            if not values:
-                async with counters_lock:
-                    failed_fetch += 1
-                continue
-            if len(values) < min_games_for_projection:
-                async with counters_lock:
-                    skipped_small_sample += 1
-                continue
-            if winsorize_pct > 0:
-                values, wc = winsorize(values, winsorize_pct)
-                async with counters_lock:
-                    winsorized_count += wc
-            if ensemble_enabled:
-                short_values = values[-short_n:] if len(values) >= short_n else values
-                long_values = values[-long_n:] if len(values) >= long_n else values
-                result, strategy_means = ensemble_projection(
-                    ensemble_weights_list,
-                    short_values,
-                    long_values,
-                    blend_alpha=regression_alpha,
-                    min_games=min_games_for_projection,
-                )
-                strategy = "ensemble"
-                if result is not None and strategy_means:
-                    parts = [f"{k}={v:.2f}" for k, v in sorted(strategy_means.items())]
-                    print(
-                        f"  Ensemble {display_name} {stat_type}: "
-                        f"{', '.join(parts)} -> mean={result.mean:.2f}"
-                    )
-            elif blend_enabled:
-                short_values = values[-short_n:] if len(values) >= short_n else values
-                long_values = values[-long_n:] if len(values) >= long_n else values
-                result, strategy = blend_short_long_result(
-                    short_values, long_values, regression_alpha, projection_method,
-                    min_games=min_games_for_projection,
-                )
-            else:
-                result = compute_projection_result(
-                    player_id=player_id,
-                    stat_type=stat_type,
-                    historical_values=values,
-                    n_games=projection_n_games,
-                    method=projection_method,
-                    min_games=min_games_for_projection,
-                )
-                strategy = projection_method
-            if result is None:
-                async with counters_lock:
-                    failed_fetch += 1
-                continue
-            # Matchup adjustment: PTS/REB/AST when matchup.py has the metric (from LeagueDashOpponentTeamStats).
-            if matchup_enabled and league_avg_metrics:
-                metric_key = None
-                if stat_type == "Points" and MATCHUP_METRIC_PTS in league_avg_metrics:
-                    metric_key = MATCHUP_METRIC_PTS
-                elif stat_type == "Rebounds" and MATCHUP_METRIC_REB in league_avg_metrics:
-                    metric_key = MATCHUP_METRIC_REB
-                elif stat_type == "Assists" and MATCHUP_METRIC_AST in league_avg_metrics:
-                    metric_key = MATCHUP_METRIC_AST
-                if metric_key is None and stat_type in ("Points", "Rebounds", "Assists"):
-                    needed = MATCHUP_METRIC_PTS if stat_type == "Points" else (MATCHUP_METRIC_REB if stat_type == "Rebounds" else MATCHUP_METRIC_AST)
-                    async with counters_lock:
-                        if stat_type not in matchup_metric_warned:
-                            print(f"DEBUG: matchup adjustment skipped for {stat_type}: {needed} not in league_avg_metrics (API may not return it).")
-                            matchup_metric_warned.add(stat_type)
-                if metric_key:
-                    home_team, away_team = game_context.get((player_id, stat_type), (None, None))
-                    opponent_team = None
-                    if nba_id and home_team and away_team:
-                        player_team_abbrev = get_player_team(nba_id)
-                        if player_team_abbrev:
-                            ht_abbrev = normalize_team_to_abbrev(home_team or "")
-                            if player_team_abbrev.upper() == ht_abbrev:
-                                opponent_team = away_team
-                            else:
-                                opponent_team = home_team
-                    opponent_abbrev = normalize_team_to_abbrev(opponent_team) if opponent_team else None
-                    if opponent_abbrev:
-                        opponent_metrics = get_team_metrics(opponent_abbrev)
-                        if metric_key in opponent_metrics:
-                            baseline_mean = result.mean
-                            adjusted_mean = adjust_for_matchup(
-                                baseline_mean,
-                                opponent_metrics,
-                                league_avg_metrics,
-                                matchup_strength,
-                                metric_key=metric_key,
-                            )
-                            if abs(adjusted_mean - baseline_mean) > 0.01:
-                                print(
-                                    f"  Matchup {display_name} {stat_type}: baseline={baseline_mean:.2f} "
-                                    f"opponent={opponent_abbrev} -> adjusted={adjusted_mean:.2f}"
-                                )
-                            result = ProjectionResult(mean=adjusted_mean, stdev=result.stdev, n=result.n, confidence=result.confidence)
-            projections[(player_id, stat_type)] = result
-            async with counters_lock:
-                strategy_counts[strategy] = strategy_counts.get(strategy, 0) + 1
-                conf = result.confidence
-                confidence_counts[conf] = confidence_counts.get(conf, 0) + 1
-
-    await asyncio.gather(
-        *(process_player(pid, st) for pid, st in player_to_stat_types.items())
+    ranked, id_to_canonical, resolved_nba_ids, projected = await run_ranking_for_snapshot(
+        snapshot, players_by_id, ingest_counters=ingest_counters, open_lines=open_lines
     )
 
-    projected = len(projections)
-    print(
-        f"Projection summary: total_keys={total_keys}, projected={projected}, "
-        f"skipped_small_sample={skipped_small_sample}, failed_fetch={failed_fetch}, winsorized_count={winsorized_count}."
-    )
-    print(
-        f"Player identity: resolved_nba_id={resolved_nba_id}, unresolved_player_skips={unresolved_player_skips}, "
-        f"duplicate_player_alias_added={ingest_counters.get('duplicate_player_alias_added', 0)}"
-    )
-    print(
-        f"Projection strategy: {', '.join(f'{k}={v}' for k, v in sorted(strategy_counts.items()))}."
-    )
-    print(
-        f"Projection confidence: insufficient={confidence_counts['insufficient']}, low={confidence_counts['low']}, "
-        f"high_variance={confidence_counts['high_variance']}, ok={confidence_counts['ok']}."
-    )
+    if os.getenv("REQUIRE_LINE_MOVEMENT_WITH_US", "0").strip().lower() in ("1", "true", "yes"):
+        delta_default = 0.0
+        ranked = [
+            e for e in ranked
+            if (e.recommended_side == "Over" and (e.delta_line if e.delta_line is not None else delta_default) < 0)
+            or (e.recommended_side == "Under" and (e.delta_line if e.delta_line is not None else delta_default) > 0)
+        ]
+        print(f"DEBUG: Filtered to {len(ranked)} props with line movement in our favor (REQUIRE_LINE_MOVEMENT_WITH_US=1).")
 
-    def projection_provider(player_id: str, stat_type: StatType) -> float | None:
-        r = projections.get((player_id, stat_type))
-        return r.mean if r is not None else None
-
-    def lookup_projection_result(player_id: str, stat_type: StatType) -> ProjectionResult | None:
-        return projections.get((player_id, stat_type))
-
-    # Optional probability calibration: load from calibration_params.json (project root); apply only for EV; store raw p_over_model
-    calibration_params = load_calibration(DEFAULT_CALIBRATION_PATH)
-    if calibration_params is not None:
-        print(f"Calibration: using params a={calibration_params[0]:.4f}, b={calibration_params[1]:.4f}")
-
-    ev_threshold = float(os.getenv("EV_THRESHOLD", "0.02").strip())
-
-    ranked = rank_props_by_edge(
-        snapshot,
-        projection_provider,
-        get_projection_result=lookup_projection_result,
-        calibration_params=calibration_params,
-        ev_threshold=ev_threshold,
-    )
-
-    print("\nTop 10 PRE-GAME +EV bets (ranked by best_ev):")
-    for i, edge in enumerate(ranked[:10], 1):
+    # Top N (EV ranking): mean±stdev, EV, book/odds, confidence label
+    top_n = 10
+    print(f"\n--- Top {top_n} props by edge/EV ---")
+    for i, edge in enumerate(ranked[:top_n], 1):
         name = id_to_canonical.get(edge.player_id, edge.player_id)
-        proj_s = f"{edge.projected:.1f}"
+        mean_s = f"{edge.projected:.1f}"
         if edge.projected_stdev is not None:
-            proj_s += f"±{edge.projected_stdev:.1f}"
-        ev_s = f"EV={edge.best_ev * 100:.2f}%" if edge.best_ev is not None else f"edge={edge.edge * 100:.2f}%"
-        book_s = edge.recommended_provider or edge.provider
-        odds_s = f" @ {edge.recommended_odds:+.0f}" if edge.recommended_odds is not None else ""
-        print(
-            f"  {i}. {name} | {edge.stat_type} {edge.recommended_side} {edge.market_line} | "
-            f"Proj: {proj_s} | {ev_s} | {book_s}{odds_s}"
-        )
+            mean_s += f"±{edge.projected_stdev:.1f}"
+        ev_s = f" EV={edge.best_ev:.3f}" if getattr(edge, "best_ev", None) is not None else ""
+        odds_s = f" O{edge.over_odds}/U{edge.under_odds}" if (edge.over_odds is not None and edge.under_odds is not None) else ""
+        book_s = f" ({edge.over_provider or '?'}/{edge.under_provider or '?'})" if (getattr(edge, "over_provider", None) or getattr(edge, "under_provider", None)) else ""
+        res = projected.get((edge.player_id, edge.stat_type), (None, None))[1]
+        confidence_s = res.confidence if (res and getattr(res, "confidence", None)) else "—"
+        print(f"  {i}. {name} {edge.stat_type} {edge.market_line} | {mean_s}{ev_s} -> {edge.recommended_side}{odds_s}{book_s} | {confidence_s}")
 
-    # Fire off alerts (filter by best_ev when available)
     high_value_alerts = alert_high_value_props(
         ranked, min_edge=0.05, min_ev=0.05, player_names=id_to_canonical
     )
     print(f"\nSuccessfully fired alerts for {len(high_value_alerts)} high-value pre-game props!")
 
-    # Persist high-value picks to database (only if we have any)
     if high_value_alerts:
         db = DatabaseManager()
         for edge in high_value_alerts:

@@ -16,6 +16,7 @@ main builds it from historical values (mean + sample stdev). Optional calibratio
 
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Literal, Tuple
 
@@ -106,6 +107,26 @@ def ev_per_unit(p_win: float, profit_if_win: float) -> float:
 def _clamp_calibrated(p: float, a: float, b: float) -> float:
     """Apply linear calibration and clamp to [0, 1]: p' = clamp(a*p + b, 0, 1)."""
     return max(0.0, min(1.0, a * p + b))
+
+
+def _prob_bounds_from_env() -> Tuple[float, float]:
+    """
+    Read P_MIN and P_MAX from env (defaults 0.05 and 0.80) and return as a sorted (low, high) tuple.
+    """
+    def _read(name: str, default: float) -> float:
+        try:
+            return float(os.getenv(name, str(default)).strip())
+        except (ValueError, TypeError):
+            return default
+
+    p_min = _read("P_MIN", 0.05)
+    p_max = _read("P_MAX", 0.80)
+    # Ensure sensible ordering and clamp to [0,1]
+    low = max(0.0, min(1.0, min(p_min, p_max)))
+    high = max(0.0, min(1.0, max(p_min, p_max)))
+    if high < low:
+        return (0.05, 0.80)
+    return (low, high)
 
 
 def load_calibration(path: Path) -> Optional[Tuple[float, float]]:
@@ -202,6 +223,9 @@ class PropEdge(BaseModel):
     over_provider: Optional[str] = Field(None, description="Book with best over odds")
     under_provider: Optional[str] = Field(None, description="Book with best under odds")
     recommended_provider: Optional[str] = Field(None, description="Book for recommended side")
+    open_line: Optional[float] = Field(None, description="Earliest line of the day (for movement)")
+    current_line: Optional[float] = Field(None, description="Current market line (same as market_line when set)")
+    delta_line: Optional[float] = Field(None, description="current_line - open_line")
 
 
 def compute_edge(projected: float, market_line: float) -> float:
@@ -245,6 +269,17 @@ def rank_props_by_edge(
     ranked: List[PropEdge] = []
     rec_threshold = ev_threshold if ev_threshold is not None else 0.02
 
+    # Load calibration params from disk if not supplied.
+    if calibration_params is None:
+        calibration_params = load_calibration(DEFAULT_CALIBRATION_PATH)
+    if calibration_params is not None:
+        a, b = calibration_params
+        print(f"Calibration: a={a:.4f}, b={b:.4f}")
+    else:
+        print("Calibration: none")
+
+    p_min, p_max = _prob_bounds_from_env()
+
     for line in snapshot.lines:
         projected = get_projection(line.player_id, line.stat_type)
         if projected is None:
@@ -281,13 +316,17 @@ def rank_props_by_edge(
             and line.over_odds is not None
             and line.under_odds is not None
         ):
-            # Optionally apply calibration for EV only (PropEdge keeps raw p_over/p_under)
+            # Optionally apply calibration for EV only (PropEdge keeps raw p_over/p_under),
+            # then clamp EV probabilities to [P_MIN, P_MAX] from env.
             p_over_ev = p_over_model_val
             p_under_ev = p_under_model_val
             if calibration_params is not None:
                 a, b = calibration_params
                 p_over_ev = _clamp_calibrated(p_over_model_val, a, b)
                 p_under_ev = 1.0 - p_over_ev
+            # Clamp to configured probability bounds (for EV only)
+            p_over_ev = max(p_min, min(p_max, p_over_ev))
+            p_under_ev = 1.0 - p_over_ev
             profit_over = american_odds_to_profit_per_dollar(line.over_odds)
             profit_under = american_odds_to_profit_per_dollar(line.under_odds)
             if profit_over is not None and profit_under is not None:
@@ -347,6 +386,9 @@ def rank_props_by_edge(
                 over_provider=over_provider_val,
                 under_provider=under_provider_val,
                 recommended_provider=recommended_provider_val,
+                open_line=None,
+                current_line=None,
+                delta_line=None,
             )
         )
 

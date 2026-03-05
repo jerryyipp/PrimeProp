@@ -10,9 +10,11 @@ these columns to picks when missing (ALTER TABLE for existing DBs).
 """
 
 import sqlite3
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+from .models import MarketSnapshot, Player, PropLine
 
 # Type alias for pick rows (sqlite3.Row)
 PickRow = sqlite3.Row
@@ -63,6 +65,32 @@ class DatabaseManager:
                 under_provider TEXT,
                 actual_result REAL,
                 won INTEGER
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                snapshot_id TEXT NOT NULL,
+                game_id TEXT NOT NULL
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS snapshot_lines (
+                snapshot_id INTEGER NOT NULL,
+                player_id TEXT NOT NULL,
+                player_name TEXT NOT NULL,
+                stat_type TEXT NOT NULL,
+                line REAL NOT NULL,
+                over_odds REAL,
+                under_odds REAL,
+                over_provider TEXT,
+                under_provider TEXT,
+                FOREIGN KEY (snapshot_id) REFERENCES snapshots(id)
             )
             """
         )
@@ -219,6 +247,154 @@ class DatabaseManager:
             (actual_result, won, pick_id),
         )
         self._conn.commit()
+
+    def save_snapshot(self, snapshot: MarketSnapshot, players_by_id: Dict[str, Player]) -> int:
+        """
+        Insert a snapshot and its lines for replay/audit.
+        Returns the snapshots.id (integer PK).
+        """
+        assert self._conn is not None
+        created_at = datetime.now(timezone.utc).isoformat()
+        cur = self._conn.execute(
+            """
+            INSERT INTO snapshots (created_at, snapshot_id, game_id)
+            VALUES (?, ?, ?)
+            """,
+            (created_at, snapshot.snapshot_id, snapshot.game_id),
+        )
+        pk = cur.lastrowid
+        if pk is None:
+            self._conn.commit()
+            raise RuntimeError("save_snapshot: failed to get lastrowid")
+        for line in snapshot.lines:
+            player = players_by_id.get(line.player_id)
+            player_name = player.canonical_name if player is not None else line.player_id
+            self._conn.execute(
+                """
+                INSERT INTO snapshot_lines (snapshot_id, player_id, player_name, stat_type, line,
+                                           over_odds, under_odds, over_provider, under_provider)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    pk,
+                    line.player_id,
+                    player_name,
+                    line.stat_type,
+                    line.threshold,
+                    line.over_odds,
+                    line.under_odds,
+                    line.over_provider,
+                    line.under_provider,
+                ),
+            )
+        self._conn.commit()
+        return pk
+
+    def load_snapshot(
+        self, snapshot_ref: int | str
+    ) -> Tuple[MarketSnapshot, Dict[str, Player]]:
+        """
+        Load a snapshot by integer id (snapshots.id) or by logical snapshot_id string.
+        Returns (MarketSnapshot, players_by_id) for replay.
+        """
+        assert self._conn is not None
+        if isinstance(snapshot_ref, int):
+            row = self._conn.execute(
+                "SELECT id, snapshot_id, game_id, created_at FROM snapshots WHERE id = ?",
+                (snapshot_ref,),
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT id, snapshot_id, game_id, created_at FROM snapshots WHERE snapshot_id = ? ORDER BY id DESC LIMIT 1",
+                (str(snapshot_ref),),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"No snapshot found for id={snapshot_ref!r}")
+        pk = row["id"]
+        snapshot_id_str = row["snapshot_id"]
+        game_id_str = row["game_id"]
+        cur = self._conn.execute(
+            """
+            SELECT player_id, player_name, stat_type, line, over_odds, under_odds, over_provider, under_provider
+            FROM snapshot_lines WHERE snapshot_id = ?
+            """,
+            (pk,),
+        )
+        lines: List[PropLine] = []
+        players_by_id: Dict[str, Player] = {}
+        for r in cur.fetchall():
+            player_id = r["player_id"]
+            player_name = r["player_name"] or player_id
+            if player_id not in players_by_id:
+                players_by_id[player_id] = Player(
+                    id=player_id,
+                    provider_name=player_name,
+                    canonical_name=player_name,
+                    nba_player_id=None,
+                    team="UNK",
+                    aliases=[],
+                )
+            provider = r["over_provider"] or r["under_provider"] or "saved"
+            lines.append(
+                PropLine(
+                    player_id=player_id,
+                    provider=provider,
+                    stat_type=r["stat_type"],
+                    threshold=float(r["line"]),
+                    over_odds=float(r["over_odds"]) if r["over_odds"] is not None else None,
+                    under_odds=float(r["under_odds"]) if r["under_odds"] is not None else None,
+                    over_provider=r["over_provider"],
+                    under_provider=r["under_provider"],
+                    home_team=None,
+                    away_team=None,
+                )
+            )
+        snapshot = MarketSnapshot(
+            snapshot_id=snapshot_id_str,
+            game_id=game_id_str,
+            lines=lines,
+        )
+        return snapshot, players_by_id
+
+    def list_snapshots(self) -> List[Tuple[int, str, str, str]]:
+        """Return list of (id, snapshot_id, game_id, created_at) for replay selection."""
+        assert self._conn is not None
+        cur = self._conn.execute(
+            "SELECT id, snapshot_id, game_id, created_at FROM snapshots ORDER BY id DESC LIMIT 100"
+        )
+        return [(r["id"], r["snapshot_id"], r["game_id"], r["created_at"]) for r in cur.fetchall()]
+
+    def get_earliest_snapshot_lines_for_game(
+        self, game_id: str, for_date: Optional[date] = None
+    ) -> Dict[Tuple[str, str], float]:
+        """
+        Return (player_id, stat_type) -> line from the earliest snapshot for this game on the given day.
+        Used for line movement: compare current line to earliest line of the day.
+        for_date: default today UTC. Returns {} if no snapshot for that game on that day.
+        """
+        assert self._conn is not None
+        if for_date is None:
+            for_date = datetime.now(timezone.utc).date()
+        date_str = for_date.isoformat()
+        row = self._conn.execute(
+            """
+            SELECT id FROM snapshots
+            WHERE game_id = ? AND date(created_at) = ?
+            ORDER BY created_at ASC LIMIT 1
+            """,
+            (game_id, date_str),
+        ).fetchone()
+        if row is None:
+            return {}
+        snap_id = row["id"]
+        cur = self._conn.execute(
+            "SELECT player_id, stat_type, line FROM snapshot_lines WHERE snapshot_id = ?",
+            (snap_id,),
+        )
+        out: Dict[Tuple[str, str], float] = {}
+        for r in cur.fetchall():
+            out[(r["player_id"], r["stat_type"])] = float(r["line"])
+        return out
 
     def close(self) -> None:
         if self._conn is not None:

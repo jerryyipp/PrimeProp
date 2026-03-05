@@ -9,7 +9,7 @@ Main.py contract:
   - get_stat_series(games: list[dict], stat_type: str) -> list[float]   # Points, Rebounds, Assists
 """
 
-__all__ = ["resolve_nba_player_id", "fetch_last_n_games", "get_stat_series"]
+__all__ = ["resolve_nba_player_id", "fetch_last_n_games", "get_stat_series", "get_rest_days", "fetch_season_to_date_avg"]
 
 import asyncio
 import json
@@ -17,7 +17,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
-from nba_api.stats.endpoints import playergamelog
+from nba_api.stats.endpoints import playercareerstats, playergamelog
 from nba_api.stats.static import players
 
 from .projection import StatType
@@ -111,6 +111,21 @@ def _gamelog_cache_key(nba_player_id: int, n: int) -> str:
     return f"gamelog|{nba_player_id}|{n}"
 
 
+def _season_avg_cache_key(nba_player_id: int, stat_type: str, season_id: str) -> str:
+    """Cache key for season-to-date average."""
+    return f"season_avg|{nba_player_id}|{stat_type}|{season_id}"
+
+
+def _current_nba_season_id() -> str:
+    """Return current NBA season string, e.g. 2024-25 (season runs Oct–Jun)."""
+    now = datetime.now(timezone.utc)
+    year = now.year
+    month = now.month
+    if month >= 10:
+        return f"{year}-{str(year + 1)[-2:]}"
+    return f"{year - 1}-{str(year)[-2:]}"
+
+
 def _get_cached_gamelog(nba_player_id: int, n: int) -> Optional[List[Dict]]:
     """Return cached gamelog rows if present and not expired."""
     cache = _load_cache()
@@ -140,8 +155,39 @@ def _set_cached_gamelog(nba_player_id: int, n: int, games: List[Dict]) -> None:
     _save_cache(cache)
 
 
+def _parse_minutes(min_val: Any) -> Optional[float]:
+    """
+    Parse MIN from nba_api gamelog into float minutes.
+    Handles 'MM:SS' strings and numeric minutes; returns None on failure.
+    """
+    if min_val is None:
+        return None
+    # Already numeric
+    if isinstance(min_val, (int, float)):
+        try:
+            return float(min_val)
+        except (TypeError, ValueError):
+            return None
+    s = str(min_val).strip()
+    if not s:
+        return None
+    # Format like '32:15'
+    if ":" in s:
+        parts = s.split(":")
+        try:
+            minutes = int(parts[0])
+            seconds = int(parts[1]) if len(parts) > 1 else 0
+            return minutes + seconds / 60.0
+        except (ValueError, TypeError):
+            return None
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+
 def _fetch_gamelog_sync(nba_player_id: int, n: int) -> List[Dict]:
-    """Fetch last n games from nba_api; return list of dicts with GAME_DATE, PTS, REB, AST."""
+    """Fetch last n games from nba_api; return list of dicts with GAME_DATE, PTS, REB, AST, MIN."""
     try:
         log = playergamelog.PlayerGameLog(player_id=nba_player_id)
         df = log.get_data_frames()[0]
@@ -152,13 +198,16 @@ def _fetch_gamelog_sync(nba_player_id: int, n: int) -> List[Dict]:
     df = df.head(n).iloc[::-1]  # oldest -> newest (chronological order for main.py)
     rows: List[Dict] = []
     for _, row in df.iterrows():
+        minutes = _parse_minutes(row.get("MIN"))
+        if minutes is None:
+            continue
         try:
-            gd = row.get("GAME_DATE")
             rows.append({
-                "GAME_DATE": str(gd) if gd is not None else "",
+                "GAME_DATE": str(row.get("GAME_DATE")) if row.get("GAME_DATE") is not None else "",
                 "PTS": float(row["PTS"]),
                 "REB": float(row["REB"]),
                 "AST": float(row["AST"]),
+                "MIN": float(minutes),
             })
         except (KeyError, ValueError, TypeError):
             continue
@@ -178,6 +227,115 @@ async def fetch_last_n_games(nba_player_id: int, n: int) -> List[Dict]:
     if games:
         _set_cached_gamelog(nba_player_id, n, games)
     return games
+
+
+def _get_cached_season_avg(nba_player_id: int, stat_type: str, season_id: str) -> Optional[float]:
+    """Return cached season average if present and not expired."""
+    cache = _load_cache()
+    key = _season_avg_cache_key(nba_player_id, stat_type, season_id)
+    entry = cache.get(key)
+    if not entry:
+        return None
+    try:
+        ts = datetime.fromisoformat(entry["cached_at"])
+    except Exception:
+        return None
+    if datetime.now(timezone.utc) - ts > CACHE_TTL:
+        return None
+    val = entry.get("value")
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _set_cached_season_avg(nba_player_id: int, stat_type: str, season_id: str, value: float) -> None:
+    cache = _load_cache()
+    key = _season_avg_cache_key(nba_player_id, stat_type, season_id)
+    cache[key] = {"cached_at": datetime.now(timezone.utc).isoformat(), "value": value}
+    _save_cache(cache)
+
+
+def _fetch_season_to_date_avg_sync(nba_player_id: int, stat_type: str) -> Optional[float]:
+    """Fetch current-season per-game average for PTS/REB/AST from nba_api PlayerCareerStats (PerGame)."""
+    st = (stat_type or "").strip().lower()
+    if st in ("points", "pts"):
+        col = "PTS"
+    elif st in ("rebounds", "reb"):
+        col = "REB"
+    elif st in ("assists", "ast"):
+        col = "AST"
+    else:
+        return None
+    try:
+        career = playercareerstats.PlayerCareerStats(player_id=nba_player_id, per_mode36="PerGame")
+        df = career.get_data_frames()[0]
+    except Exception:
+        return None
+    if df is None or df.empty:
+        return None
+    season_id = _current_nba_season_id()
+    row = df.loc[df["SEASON_ID"] == season_id]
+    if row.empty:
+        return None
+    try:
+        return float(row.iloc[0][col])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+
+
+async def fetch_season_to_date_avg(nba_player_id: int, stat_type: str) -> Optional[float]:
+    """
+    Return season-to-date per-game average for PTS/REB/AST. Uses same cache (stats_cache.json) and TTL as gamelog.
+    """
+    season_id = _current_nba_season_id()
+    cached = _get_cached_season_avg(nba_player_id, stat_type, season_id)
+    if cached is not None:
+        return cached
+    await asyncio.sleep(0.5)
+    value = await asyncio.to_thread(_fetch_season_to_date_avg_sync, nba_player_id, stat_type)
+    if value is not None:
+        _set_cached_season_avg(nba_player_id, stat_type, season_id, value)
+    return value
+
+
+def _parse_gamelog_date(game_date_str: str) -> Optional[date]:
+    """Parse GAME_DATE from gamelog (ISO 'YYYY-MM-DD', 'YYYY-MM-DD HH:MM:SS', or '%b %d, %Y' e.g. NOV 15, 2024)."""
+    if not game_date_str or not isinstance(game_date_str, str):
+        return None
+    s = game_date_str.strip()
+    if not s:
+        return None
+    try:
+        # ISO or "YYYY-MM-DD HH:MM:SS"
+        if "-" in s and s[4] == "-":
+            return date.fromisoformat(s[:10])
+        # "%b %d, %Y" e.g. NOV 15, 2024
+        dt = datetime.strptime(s, "%b %d, %Y")
+        return dt.date()
+    except (ValueError, TypeError):
+        return None
+
+
+def get_rest_days(games: List[Dict], target_game_date: date) -> Optional[int]:
+    """
+    Days between the player's last game and the target game date.
+    games: list of gamelog dicts with GAME_DATE (oldest to newest).
+    Returns: 0 = back-to-back, 1 = one day rest, 2+ = two or more days rest; None if unknown.
+    """
+    if not games:
+        return None
+    last = games[-1]
+    gd = last.get("GAME_DATE")
+    if gd is None:
+        return None
+    last_date = _parse_gamelog_date(str(gd))
+    if last_date is None:
+        return None
+    delta = (target_game_date - last_date).days
+    return max(0, delta)
 
 
 def get_stat_series(games: List[Dict], stat_type: str) -> List[float]:

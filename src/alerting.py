@@ -13,6 +13,7 @@ import urllib.request
 from typing import Dict, List, Optional
 
 from .optimizer import PropEdge
+from .projection import projection_interval
 
 
 # Confidence Score = edge as a percentage (e.g. 7.5 for 7.5% edge).
@@ -34,7 +35,14 @@ def format_alert(
     line_val = prop_edge.market_line
     mean_s = f"{prop_edge.projected:.1f}"
     if prop_edge.projected_stdev is not None:
-        mean_s += f" ± {prop_edge.projected_stdev:.1f}"
+        mean_s += f"±{prop_edge.projected_stdev:.1f}"
+        try:
+            level = float(os.getenv("PROJECTION_INTERVAL_LEVEL", "0.80").strip())
+        except (ValueError, TypeError):
+            level = 0.80
+        level = max(0.5, min(0.999, level))
+        low, high = projection_interval(prop_edge.projected, prop_edge.projected_stdev, level)
+        mean_s += f" ({int(level * 100)}%: {low:.1f}–{high:.1f})"
     p_model = None
     if prop_edge.recommended_side == "Over" and prop_edge.p_over_model is not None:
         p_model = prop_edge.p_over_model
@@ -46,13 +54,23 @@ def format_alert(
     odds_str = f"{prop_edge.recommended_odds:+.0f}" if prop_edge.recommended_odds is not None else "—"
     book_str = prop_edge.recommended_provider or prop_edge.provider or "—"
 
+    line_move_str = ""
+    if (
+        getattr(prop_edge, "open_line", None) is not None
+        and getattr(prop_edge, "current_line", None) is not None
+        and getattr(prop_edge, "delta_line", None) is not None
+    ):
+        d = prop_edge.delta_line
+        line_move_str = f"\nLine moved: {prop_edge.open_line} -> {prop_edge.current_line} ({'+' if d >= 0 else ''}{d})"
+
     return (
         f"**High-value prop**\n"
         f"Player: {name}\n"
         f"Line: {prop_edge.stat_type} {line_val}\n"
-        f"Mean±stdev: {mean_s}\n"
+        f"Proj: {mean_s}\n"
         f"{p_str} | {ev_str}\n"
         f"Side: {side_str} | Odds: {odds_str} | Book: {book_str}"
+        f"{line_move_str}"
     )
 
 

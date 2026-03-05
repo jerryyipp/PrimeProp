@@ -2,16 +2,26 @@
 Auto-grade stored picks: load ungraded picks (game in the past), fetch actual stat
 from nba_api, compare to market_line, and update won/actual_result.
 Uses pick timestamp date as game date. Includes logging and safe retry behavior.
+
+Run from project root: python -m src.grade_picks
+Or from src/: python grade_picks.py (adds project root to path).
 """
+
+import sys
+from pathlib import Path
+
+# Allow running as script from src/ (e.g. python grade_picks.py)
+_root = Path(__file__).resolve().parent.parent
+if _root not in sys.path:
+    sys.path.insert(0, str(_root))
 
 import logging
 import time
 from datetime import datetime, timezone, timedelta
-from pathlib import Path
 from typing import Optional
 
-from .database import DatabaseManager
-from .stats import fetch_game_result, resolve_nba_player_id
+from src.database import DatabaseManager
+from src.stats import fetch_game_result, resolve_nba_player_id
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -78,7 +88,7 @@ def grade_picks(
             continue
         game_date = dt.date()
 
-        nba_id = pick.get("nba_player_id")
+        nba_id = pick["nba_player_id"] if "nba_player_id" in pick.keys() else None
         if nba_id is not None:
             try:
                 nba_id = int(nba_id)

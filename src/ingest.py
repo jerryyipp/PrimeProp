@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import os
 import re
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -8,6 +9,52 @@ import aiohttp
 from thefuzz import process
 
 from .models import MarketSnapshot, Player, PropLine
+
+# Ingest resilience: timeout, retries, circuit breaker (env with defaults).
+def _ingest_timeout_s() -> float:
+    try:
+        return float(os.getenv("INGEST_TIMEOUT_S", "12").strip())
+    except (ValueError, TypeError):
+        return 12.0
+
+
+def _ingest_retries() -> int:
+    try:
+        return max(0, int(os.getenv("INGEST_RETRIES", "3").strip()))
+    except (ValueError, TypeError):
+        return 3
+
+
+def _ingest_cb_max_failures() -> int:
+    try:
+        return max(1, int(os.getenv("INGEST_CB_MAX_FAILURES", "3").strip()))
+    except (ValueError, TypeError):
+        return 3
+
+
+def _event_request_delay_s() -> float:
+    """Delay between each event odds fetch (default 0.5s)."""
+    try:
+        return max(0.0, float(os.getenv("EVENT_REQUEST_DELAY_S", "0.5").strip()))
+    except (ValueError, TypeError):
+        return 0.5
+
+
+def _ingest_429_backoff_base_s() -> float:
+    """Base delay in seconds for 429 exponential backoff (default 2). Delays: base, 2*base, 4*base."""
+    try:
+        return max(0.5, float(os.getenv("INGEST_429_BACKOFF_BASE_S", "2").strip()))
+    except (ValueError, TypeError):
+        return 2.0
+
+
+def _ingest_max_retries() -> int:
+    """Max retries after initial attempt (default 3). Total attempts = 1 + this."""
+    try:
+        return max(0, int(os.getenv("INGEST_MAX_RETRIES", "3").strip()))
+    except (ValueError, TypeError):
+        return 3
+
 
 # PropLine only accepts Points/Rebounds/Assists; filter to these when building lines.
 ALLOWED_STAT_TYPES = ("Points", "Rebounds", "Assists")
@@ -127,7 +174,10 @@ class ProviderIngestor(ABC):
         raise NotImplementedError
 
 
-# Small helper for issuing an HTTP GET and decoding JSON, letting HTTP errors surface naturally.
+# Exponential backoff delays (seconds) for non-429 retries: 0.5, 1, 2.
+_FETCH_BACKOFF = (0.5, 1.0, 2.0)
+
+
 async def _fetch_json(
     session: aiohttp.ClientSession,
     url: str,
@@ -135,9 +185,49 @@ async def _fetch_json(
     params: Optional[Dict[str, Any]] = None,
     headers: Optional[Dict[str, str]] = None,
 ) -> Any:
-    async with session.get(url, params=params, headers=headers) as response:
-        response.raise_for_status()
-        return await response.json()
+    """
+    HTTP GET with timeout (session default), retries (env INGEST_RETRIES / INGEST_MAX_RETRIES for 429).
+    On HTTP 429: retry with exponential backoff (INGEST_429_BACKOFF_BASE_S * 2^attempt).
+    Logs "429 rate limit; backing off {delay}s (attempt x/y)" on 429 retries.
+    Raises after all attempts fail.
+    """
+    retries = _ingest_retries()
+    max_retries_429 = _ingest_max_retries()
+    base_429 = _ingest_429_backoff_base_s()
+    total_429 = 1 + max_retries_429
+    total_attempts = 1 + retries
+    attempt_429 = 0
+    attempt_generic = 0
+
+    while True:
+        try:
+            async with session.get(url, params=params, headers=headers) as response:
+                if response.status == 429:
+                    if attempt_429 < max_retries_429:
+                        delay = base_429 * (2 ** attempt_429)
+                        print(f"429 rate limit; backing off {delay:.1f}s (attempt {attempt_429 + 1}/{total_429})")
+                        await asyncio.sleep(delay)
+                        attempt_429 += 1
+                        continue
+                    response.raise_for_status()
+                response.raise_for_status()
+                return await response.json()
+        except aiohttp.ClientResponseError as e:
+            if e.status == 429 and attempt_429 < max_retries_429:
+                delay = base_429 * (2 ** attempt_429)
+                print(f"429 rate limit; backing off {delay:.1f}s (attempt {attempt_429 + 1}/{total_429})")
+                await asyncio.sleep(delay)
+                attempt_429 += 1
+                continue
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+            if attempt_generic < retries:
+                delay = _FETCH_BACKOFF[attempt_generic] if attempt_generic < len(_FETCH_BACKOFF) else _FETCH_BACKOFF[-1]
+                print(f"WARNING: Ingest fetch failed (attempt {attempt_generic + 1}/{total_attempts}), retrying in {delay}s: {e!r}")
+                await asyncio.sleep(delay)
+                attempt_generic += 1
+                continue
+            raise
 
 
 # Ingestor for The Odds API–style payloads; normalizes markets/outcomes into PropLine instances.
@@ -344,8 +434,9 @@ class PrizePicksIngestor(ProviderIngestor):
         return lines
 
 
-# Orchestrates concurrent ingestion from multiple providers into a single MarketSnapshot.
-# Returns (snapshot, players_by_id, counters). Counters may include duplicate_player_alias_added.
+# Orchestrates ingestion from multiple providers into a single MarketSnapshot.
+# Uses timeout, retries with backoff, and a per-bookmaker circuit breaker so failures do not crash the run.
+# Returns (snapshot, players_by_id, counters). Partial snapshot if some providers fail.
 async def fetch_multi_source_snapshot(
     snapshot_id: str,
     game_id: str,
@@ -354,17 +445,34 @@ async def fetch_multi_source_snapshot(
 ) -> Tuple[MarketSnapshot, Dict[str, Player], Dict[str, int]]:
     counters: Dict[str, int] = {}
     matcher = FuzzyNameMatcher(players, counters=counters)
+    timeout_s = _ingest_timeout_s()
+    cb_max = _ingest_cb_max_failures()
+    # Per bookmaker (provider_name) failure count; after cb_max we skip that bookmaker for the rest of the run.
+    circuit_failures: Dict[str, int] = {}
 
-    async with aiohttp.ClientSession() as session:
-        results = await asyncio.gather(
-            *(provider.fetch_lines(session, matcher) for provider in providers),
-            return_exceptions=True,
-        )
+    timeout = aiohttp.ClientTimeout(total=timeout_s)
+    event_delay_s = _event_request_delay_s()
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        results: List[List[PropLine]] = []
+        for i, provider in enumerate(providers):
+            if i > 0 and event_delay_s > 0:
+                await asyncio.sleep(event_delay_s)
+            name = getattr(provider, "provider_name", "unknown")
+            if circuit_failures.get(name, 0) >= cb_max:
+                print(f"WARNING: Ingest skipping {name!r} (circuit breaker open after {cb_max} failures).")
+                results.append([])
+                continue
+            try:
+                lines = await provider.fetch_lines(session, matcher)
+                results.append(lines if isinstance(lines, list) else [])
+            except Exception as e:
+                circuit_failures[name] = circuit_failures.get(name, 0) + 1
+                if circuit_failures[name] >= cb_max:
+                    print(f"WARNING: Ingest circuit breaker open for {name!r} after {cb_max} failures; skipping for remainder of run.")
+                results.append([])
 
     all_lines: List[PropLine] = []
     for result in results:
-        if isinstance(result, Exception):
-            continue
         all_lines.extend(result)
 
     snapshot = MarketSnapshot(

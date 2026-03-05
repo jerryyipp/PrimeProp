@@ -1,14 +1,23 @@
 """
 Backtest graded picks: hit rate, Brier score, log loss, calibration bin report (avg predicted vs actual hit rate),
 EV vs realized profit. Use --fit to fit and save calibration (a, b).
+
+Run from project root: python -m src.backtest
+Or from src/: python backtest.py (adds project root to path).
 """
 
+import sys
 import math
 from pathlib import Path
 from typing import Optional
 
-from .database import DatabaseManager
-from .optimizer import profit_per_unit
+# Allow running as script from src/ (e.g. python backtest.py)
+_root = Path(__file__).resolve().parent.parent
+if _root not in sys.path:
+    sys.path.insert(0, str(_root))
+
+from src.database import DatabaseManager
+from src.optimizer import profit_per_unit
 
 
 # Bins for model probability (Over): (low, high) in [0, 1]
@@ -32,7 +41,7 @@ def _p_win_for_pick(row) -> Optional[float]:
         p_over = None
     if p_over is None:
         return None
-    side = (row.get("recommended_side") or "").strip()
+    side = (row["recommended_side"] if "recommended_side" in row.keys() else "").strip()
     if side == "Over":
         return float(p_over)
     if side == "Under":
@@ -127,7 +136,7 @@ def run_backtest(db_path: Optional[Path] = None) -> None:
 
 if __name__ == "__main__":
     import sys
-    from .optimizer import fit_calibration_from_picks, save_calibration, DEFAULT_CALIBRATION_PATH
+    from src.optimizer import fit_calibration_from_picks, save_calibration, DEFAULT_CALIBRATION_PATH
 
     if "--fit" in sys.argv:
         db = DatabaseManager()

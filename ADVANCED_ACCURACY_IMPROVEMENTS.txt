@@ -2,195 +2,143 @@
 MORE WAYS TO MAKE PRIMEPROP MORE ADVANCED AND ACCURATE
 ================================================================================
 
-Below are additional directions beyond configurable N/method and filter-by-strategy.
-Each can be implemented incrementally.
+Below are additional directions beyond what is already implemented.
+Each can be adopted incrementally.
 
 --------------------------------------------------------------------------------
-CURRENT STATE (AS OF LATEST CODE)
+CURRENT STATE (AS OF LATEST CODE) — WHAT'S DONE
 --------------------------------------------------------------------------------
 
   Ingest (ingest.py):
     - Odds API restricted to bookmakers: fanduel, draftkings, betmgm.
-    - Main-line selection per player: tightest juice (smallest over/under imbalance)
-      chosen; alt-lines (other thresholds) dropped.
-    - One-way markets dropped: lines with imbalance == 999.0 (missing over or under)
-      are skipped so they don't block Unders.
-    - FuzzyNameMatcher score_cutoff = 95 to avoid merging different players.
+    - Main-line selection per player: tightest juice; alt-lines dropped.
+    - One-way markets dropped (imbalance == 999.0).
+    - FuzzyNameMatcher score_cutoff = 95.
+    - aggregate_snapshot_by_best_odds: best over_odds and under_odds across
+      books per (player, stat_type, threshold); over_provider/under_provider set.
 
   Projection (projection.py, stats.py):
-    - Single point estimate only: weighted_average or simple_average over last N
-      games (main.py uses N=10, weighted_average only).
-    - Stats from nba_api with 24-hour file cache; no opponent, pace, or home/away.
-    - Markets requested: player_points, player_rebounds, player_assists only
-      (PRA and Threes are in STAT_TYPE_KEY_MAP but not in the Odds API markets
-      param in main.py).
+    - ProjectionResult(mean, stdev, n, confidence); weighted/simple/exponential.
+    - blend_short_long_result (regression-to-mean style blend).
+    - ensemble_projection (weighted combo of methods).
+    - Optional matchup adjustment (adjust_for_matchup) for PTS/REB/AST using
+      opponent defensive metrics from matchup.py.
+    - Winsorization (optional via WINSORIZE_PCT).
+    - Configurable: PROJECTION_N_GAMES, PROJECTION_METHOD, MIN_GAMES_FOR_PROJECTION,
+      PROJECTION_STRATEGY (single/blend/ensemble), ENSEMBLE_WEIGHTS.
+    - Stats from nba_api with 24-hour cache; Points/Rebounds/Assists; PRA/Threes
+      via ENABLE_EXTRA_MARKETS.
 
   Optimizer (optimizer.py):
-    - Edge = (projected - market_line) / market_line.
-    - Over/Under/Pass by 5% edge threshold; sort by |edge| so strong Unders rank
-      with strong Overs; display uses abs(edge) for percentage.
-    - Sanity cap: |edge| > 40% skipped (injury/backup noise).
-    - over_odds/under_odds are on PropLine but NOT used for true EV (no
-      probability-based EV yet).
+    - True EV from Normal(mean, stdev) + American odds; P(Over) via CDF.
+    - best_ev, recommended_side, recommended_odds, recommended_provider.
+    - Optional calibration (calibration_params.json): p' = clamp(a*p + b, 0, 1).
+    - rank_props_by_edge sorts by best_ev descending; ev_threshold filter.
+    - Edge kept for display and fallback when odds missing.
 
-  Database (database.py):
-    - Picks logged with market_line, projected, edge, recommended_side;
-      actual_result and won remain NULL until graded (no auto-grading).
+  Database & automation:
+    - grade_picks.py: auto-fetches actual results from NBA.com, updates won.
+    - backtest.py: fits calibration from graded picks, saves to calibration_params.json.
 
 --------------------------------------------------------------------------------
 1. RICHER PROJECTIONS (ACCURACY)
 --------------------------------------------------------------------------------
 
-1.1 Variance and confidence
+1.1 Home/away and rest context
 
-  - Today: src/projection.py returns a single point estimate; src/optimizer.py
-    uses it for edge with no notion of uncertainty.
-  - Add: From the same historical_values (last N games), compute standard
-    deviation (and optionally higher moments). Expose alongside projection,
-    e.g. (mean, std) or a small ProjectionResult in projection.py.
-  - Use: (a) P(Over) via normal CDF: P(X > line) = 1 - Phi((line - mean) / std)
-    for true EV and better ranking; (b) confidence flags: e.g. "low variance"
-    vs "high variance" props for filtering; (c) optional confidence interval
-    in alerts (e.g. "projected 24.2 (20-28)").
+  - Gap: Projections use only player history; no home/away or rest days.
+  - Add: In main, resolve game context (home_team, away_team from Odds API).
+    For each player, determine if home/away and days since last game.
+  - Use: In projection or a wrapper: home/away multiplier (e.g. +2% home),
+    rest-day adjustment (e.g. -1% on back-to-back). Reduces bias in extreme
+    schedule spots.
 
-1.2 Opponent / matchup context
+1.2 Season-to-date vs last-N blend
 
-  - Gap: Projections use only the player's own history; no opponent, pace, or
-    home/away.
-  - Add: When building projections in main, resolve game context (e.g. from
-    Odds API event: home_team, away_team). Fetch opponent defensive stats
-    (e.g. NBA API or cached: points allowed per game to position, pace).
-    Optionally: home/away, rest days, back-to-back.
-  - Use: In src/projection.py or a wrapper: opponent-adjusted projection =
-    baseline_projection * (league_avg / opponent_allowance) or add a small
-    adjustment module that takes baseline + matchup features and returns
-    adjusted projection. This improves accuracy when matchup is favorable/
-    unfavorable.
+  - Gap: All methods use last N games; no explicit season baseline.
+  - Add: Optionally fetch season-to-date average; blend projection = alpha *
+    last_N + (1 - alpha) * season_avg with configurable alpha. Helps when
+    sample is small or noisy (e.g. return from injury).
 
-1.3 Regression to the mean
+1.3 Confidence interval in alerts
 
-  - Idea: Extreme recent runs (e.g. last 3 games way above season) often
-    regress; very low recent runs can bounce back.
-  - Add: In projection.py, optionally blend short-term (e.g. last 5) with
-    long-term (e.g. last 20 or season). Formula: projection = alpha * short_term
-    + (1 - alpha) * long_term with configurable alpha (or derive from variance).
-    Reduces overreaction to hot/cold streaks.
-
-1.4 Ensemble projections
-
-  - Idea: Combine multiple methods (weighted_avg, simple_avg, exponential,
-    season, optional ML) into one number or a weighted vote.
-  - Add: A small ensemble function or provider that takes several projection
-    providers and weights (e.g. 0.5 last_10_weighted + 0.3 last_5_simple + 0.2
-    season). Use as one of the "strategies" so users can bet "by ensemble" and
-    compare vs single-method.
+  - Today: Alerts show mean±stdev, best_ev, side, odds.
+  - Add: Optional "projected 24.2 (20–28)" style 80% or 90% interval in
+    alerts. Helps users judge risk vs line.
 
 --------------------------------------------------------------------------------
-2. TRUE EV AND USE OF ODDS (ACCURACY + PRODUCT)
+2. BET SIZING AND ODDS (PRODUCT)
 --------------------------------------------------------------------------------
 
-2.1 Probability-based EV
+2.1 Kelly or fractional stake suggestion
 
-  - Today: Edge = (projected - line) / line; PropLine has over_odds/under_odds
-    but rank_props_by_edge does not use them. calculate_implied_probability
-    exists in optimizer.py but is unused.
-  - Add: From projection (and optionally std), compute model-implied P(Over).
-    Then EV_over = P(Over) * profit_if_over + (1 - P(Over)) * (-1) (per unit
-    stake) using calculate_implied_probability and American-to-decimal payout.
-    Same for Under. Attach ev_over, ev_under (or best EV and recommended side)
-    to a PropEdge-like model.
-  - Use: Sort/filter by true EV (e.g. "show only props with EV > 3%"); display
-    EV in alerts; optionally prefer "best EV" over "best edge" when odds are
-    available.
-
-2.2 Kelly or fractional stake suggestion
-
-  - Idea: Given edge or EV and odds, suggest stake size (e.g. full Kelly or
-    half Kelly) so users size bets by expected value.
-  - Add: In optimizer or a small bankroll.py: kelly_fraction(edge_or_ev, odds)
-    -> fraction of bankroll. Optional in alerts: "Suggested stake: 2% of
+  - Idea: Given EV and odds, suggest stake size (e.g. half Kelly).
+  - Add: In optimizer or a small bankroll.py: kelly_fraction(ev, odds) ->
+    fraction of bankroll. Optional in alerts: "Suggested stake: 2% of
     bankroll (half Kelly)."
+  - Use: Helps users size bets by expected value instead of flat units.
 
 --------------------------------------------------------------------------------
-3. BACKTESTING AND CALIBRATION (ACCURACY + TRUST)
+3. CLOSING LINE VALUE AND LINE MOVEMENT (TRUST + ACCURACY)
 --------------------------------------------------------------------------------
 
-3.1 Backtest on historical picks
+3.1 Closing line value (CLV)
 
-  - Today: src/database.py stores market_line, projected, edge, actual_result,
-    won; get_win_rate() exists for graded picks.
-  - Add: A backtest script or module that: (a) loads graded picks (or uses
-    historical snapshots if you ever store them); (b) by projection method /
-    n_games / edge bucket, computes hit rate vs expected (from edge or implied
-    P(Over)); (c) outputs simple tables: e.g. "When edge was 5-10%, we hit 58%
-    (expected ~55%)." Helps validate which projection source is most accurate.
+  - Idea: Beating the closing line is a strong signal of value.
+  - Add: Store closing_line (and optionally closing_odds) per pick, e.g.
+    scraped or from API at game time. Compare our pick's line to closing.
+  - Report: "We took Over at 24.5, closing was 25" = positive CLV. Add CLV
+    to backtest output and any dashboard so users see how often they beat
+    the close.
 
-3.2 Calibration
+3.2 Line movement tracking
 
-  - Idea: If we output "P(Over) = 0.62," we want 62% of those to actually go
-    over in the long run.
-  - Add: Over graded picks, group by binned model P(Over) (e.g. 0.5-0.55,x 
-    0.55-0.6, ...) and compare to actual hit rate. If biased (e.g. we say 60%
-    but hit 52%), apply a recalibration (e.g. Platt scaling or simple linear
-    correction) to P(Over) before computing EV. Improves long-run accuracy of
-    EV and confidence.
-
-3.3 Closing line value (CLV)
-
-  - Idea: Beating the closing line is a strong signal of value. Requires
-    storing closing line (e.g. scraped or from API at game time) and comparing
-    our pick's line to it.
-  - Add: Optional closing_line (and maybe closing_odds) on picks; a metric "we
-    took Over at 24.5, closing was 25" = positive CLV. Report CLV in backtest
-    and in dashboard so users see how often they beat the close.
+  - Idea: Track the same prop over time (e.g. line was 24.5 morning, now 25).
+  - Add: Persist snapshots (snapshot_id, timestamp, lines) or (player, stat,
+    line, timestamp) in DB or files. A small line movement module: for each
+    prop, compare current line to earliest/previous line.
+  - Use: In UI/alerts: "Line moved from 24.5 to 25 (we like Over)." Later:
+    filter "only show props with line movement in our direction."
 
 --------------------------------------------------------------------------------
-4. MULTI-BOOK AND LINE MOVEMENT (PRODUCT + ACCURACY)
+4. INGEST ROBUSTNESS AND QUALITY
 --------------------------------------------------------------------------------
 
-4.1 Best odds per side
+4.1 Retries and circuit breakers
 
-  - Today: We restrict to fanduel, draftkings, betmgm and pick one main line
-    per (player, stat_type) by juice. We still emit one PropLine per
-    (player, stat_type, provider); ranking doesn't pick the best odds across
-    books for over vs under.
-  - Add: When multiple providers have the same (player, stat_type, threshold),
-    surface best over_odds and best under_odds (and which book). Rank/sort by
-    best available EV per prop so "filter by EV" uses the best odds the user
-    could get. Display "Bet Over at Book A (-105), Under at Book B (+100)."
+  - Gap: Failed provider requests are skipped; no retries.
+  - Add: Retries with exponential backoff; timeouts per request; circuit
+    breaker so one bad provider doesn't block snapshots. Log failures for
+    debugging.
 
-4.2 Line movement
+4.2 Snapshot persistence for replay
 
-  - Idea: Track the same prop over time (e.g. line was 24.5 this morning, now
-    25). Movement toward our projection can confirm value; movement away can
-    signal sharp action.
-  - Add: Persist snapshots (e.g. snapshot_id, timestamp, lines) or at least
-    store (player, stat_type, line, timestamp) in DB or files. A small line
-    movement module: for each prop, compare current line to earliest (or
-    previous) line. In UI/alerts: "Line moved from 24.5 to 25 (we like Over)."
-    Later: filter "only show props with line movement in our direction."
+  - Idea: Store MarketSnapshot (or key fields) so you can replay and audit.
+  - Add: Optional persistence of snapshots to DB or files (snapshot_id,
+    timestamp, lines). Enables backtesting on historical lines and
+    debugging edge cases.
 
 --------------------------------------------------------------------------------
-5. OPTIONAL ML AND AUTOMATION
+5. OPTIONAL ML AND ADVANCED FEATURES
 --------------------------------------------------------------------------------
 
 5.1 Simple ML projection model
 
   - Idea: Use features (last N stats, opponent defensive rating, home/away,
     rest, pace) to predict stat. Start with ridge or gradient boosting
-    (e.g. sklearn or LightGBM) on historical (player, game, stat) data. Output
-    becomes another projection provider ("ml" or "ai").
-  - Add: A small src/ml_projector.py (or under ai_provider): train offline on
-    historical game logs (nba_api or your DB); at inference, take (player_id,
-    stat_type, matchup_features) and return projected value. Plug in as
-    ProjectionProvider; use in "filter by AI pick" and for ensemble.
+    (sklearn, LightGBM) on historical (player, game, stat) data.
+  - Add: src/ml_projector.py: train offline on game logs; at inference,
+    take (player_id, stat_type, matchup_features) and return projected value.
+    Plug in as ProjectionProvider; use in ensemble and "filter by AI pick."
 
-5.2 Auto-grading picks
+5.2 PRA and Threes in Odds API
 
-  - Today: actual_result and won are NULL until manually graded.
-  - Add: After games finish, fetch actual box score (nba_api or similar) for
-    the player/stat, compare to market_line and set actual_result and won.
-    Enables automatic backtest and calibration without manual data entry.
+  - Gap: main.py may request only player_points, player_rebounds,
+    player_assists. PRA and Threes are supported in projection/stats via
+    ENABLE_EXTRA_MARKETS but must be in the Odds API markets param.
+  - Add: If your Odds API tier supports them, add
+    "player_points_rebounds_assists,player_threes" to markets. Quick way to
+    expand props without structural changes.
 
 --------------------------------------------------------------------------------
 6. SUMMARY DIAGRAM (CONCEPTUAL)
@@ -199,66 +147,27 @@ CURRENT STATE (AS OF LATEST CODE)
   Inputs: Odds API, NBA Stats, Matchup/Opponent
        |
        v
-  Projection Layer: Last N methods, Variance (mean/std), Opponent adjust,
-                   Ensemble, ML model
+  Projection: Last N, Variance (mean/std), Matchup adjust, Blend, Ensemble
        |
        v
-  Evaluation: Edge, P(Over) from CDF, True EV with odds, Kelly stake suggestion
+  Evaluation: P(Over) from CDF, True EV with odds, Calibration
        |
        v
-  Output: Rank and filter, Alerts, Picks DB, Backtest and calibration
+  Output: Rank by best_ev, Alerts, Picks DB, Grade picks, Backtest
        |
        v
-  Backtest can feed back into Matchup/calibration.
+  Backtest feeds calibration; CLV and line movement are future enhancements.
 
 --------------------------------------------------------------------------------
 7. SUGGESTED PRIORITY (FOR IMPLEMENTATION)
 --------------------------------------------------------------------------------
 
-  - High impact, moderate effort: Variance + P(Over) + true EV (sections 1.1,
-    2.1); configurable strategy and sort/filter (from previous plan).
-  - High impact, more effort: Opponent/matchup adjustment (1.2); backtest +
-    calibration (3.1, 3.2); best odds across books (4.1).
-  - Differentiation: Ensemble (1.4); line movement (4.2); optional ML (5.1)
-    and auto-grading (5.2).
-  - Polish: Regression to mean (1.3); Kelly suggestion (2.2); CLV (3.3).
+  - Quick wins: PRA and Threes in Odds API (5.2); confidence interval in
+    alerts (1.3).
+  - High impact: Home/away + rest (1.1); Kelly suggestion (2.1); retries and
+    circuit breakers (4.1).
+  - Trust and differentiation: CLV (3.1); line movement (3.2); snapshot
+    persistence (4.2).
+  - Advanced: Season blend (1.2); ML projection (5.1).
 
---------------------------------------------------------------------------------
-8. QUICK WINS FROM CURRENT CODE (ACCURACY)
---------------------------------------------------------------------------------
-
-  These improvements are directly suggested by the current implementation and
-  require minimal structural change:
-
-  8.1 Add PRA and Threes to Odds API markets
-    - Today: main.py requests only "player_points,player_rebounds,player_assists".
-    - Change: Add "player_points_rebounds_assists,player_threes" to the markets
-      param if your Odds API tier and books support them. STAT_TYPE_KEY_MAP and
-      projection/stats already support PRA and Threes; this only expands the
-      props you ingest and rank.
-
-  8.2 Configurable n_games and projection method
-    - Today: main.py hardcodes n_games=10 and method="weighted_average".
-    - Add: Env vars (e.g. PROJECTION_N_GAMES, PROJECTION_METHOD) or CLI args
-      so you can test 5 vs 10 vs 15 games and weighted vs simple without
-      code changes. Enables simple A/B testing and tuning.
-
-  8.3 Minimum sample size for projections
-    - Today: get_projection uses whatever historical_values are available (even
-      one game) and returns 0.0 only when empty.
-    - Add: In main.py, skip building a projection (or treat as "no projection")
-      when len(values) < k (e.g. 5). Avoids ranking props on 1–2 games after
-      return from injury or small sample noise. Reduces false edges.
-
-  8.4 Use odds in optimizer for true EV (high impact)
-    - Today: rank_props_by_edge ignores line.over_odds and line.under_odds;
-      ranking is by edge magnitude only.
-    - Add: Compute model P(Over) from projection (and optionally std from 1.1);
-      then EV_over = P(Over)*decimal_profit_over + (1-P(Over))*(-1) using
-      calculate_implied_probability. Rank or filter by true EV so props with
-      better odds for the same edge rank higher; reduces confusion when same
-      prop appears at different books with different juice.
-
-You can adopt these in any order; the codebase is already structured so
-projection providers, optimizer outputs, and DB can be extended without
-breaking the current flow.
+================================================================================

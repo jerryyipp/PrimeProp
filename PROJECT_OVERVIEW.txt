@@ -13,17 +13,19 @@ improved later for accuracy, robustness, and features.
 1.1  src/models.py — Core data models (Pydantic)
 
   • Player
-    - id: stable internal identifier (slug + short hash)
+    - id: stable internal identifier (slug + short hash of canonical_name)
     - provider_name: raw name from provider (e.g. Odds API)
-    - canonical_name: display / matching name (initially = provider_name for new players)
-    - nba_player_id: optional when resolved
+    - canonical_name: display / matching name (use for display)
+    - nba_player_id: optional when resolved via stats.resolve_nba_player_id
     - team: 2–3 letter code (default UNK)
     - aliases: list of alternate names (e.g. "Steph Curry" for Stephen Curry)
 
   • PropLine
-    - player_id, provider, stat_type (Points/Rebounds/Assists/PRA/Threes)
+    - player_id, provider, stat_type: Literal["Points", "Rebounds", "Assists"]
     - threshold: the line number (must be > 0, enforced by validator)
-    - over_odds / under_odds: optional integers
+    - over_odds / under_odds: optional floats
+    - over_provider / under_provider: book offering best odds (when aggregated)
+    - home_team / away_team: event context (from Odds API)
 
   • MarketSnapshot
     - snapshot_id, timestamp (default UTC now), game_id
@@ -64,43 +66,74 @@ improved later for accuracy, robustness, and features.
     - Merges all PropLine lists into a single MarketSnapshot.
     - Failed providers are skipped (return_exceptions=True); no retries.
 
-
-1.3  src/projection.py — Historical stat projection engine
-
-  • get_projection(player_id, stat_type, historical_values, n_games=10, method=...)
-    - Takes a player id, stat type, and an ordered list of historical stat
-      values (oldest to newest).
-    - Uses the last n_games values only.
-    - Returns a single projected stat value (float).
-    - Methods:
-      - "weighted_average" (default): linear weights so the most recent game
-        has the highest weight.
-      - "simple_average": plain mean of the last n_games.
-
-  • compute_weighted_average(values) / compute_simple_average(values)
-    - Helpers used by get_projection; can be reused elsewhere.
-
-  • No data loading: the caller must supply historical_values (e.g. from DB
-    or game-log API).
+  • aggregate_snapshot_by_best_odds(snapshot, stat_types)
+    - Merges lines from multiple books into one PropLine per (player_id, stat_type, threshold).
+    - Picks best over_odds and under_odds across providers; sets over_provider/under_provider.
 
 
-1.4  src/optimizer.py — Expected value (+EV) optimizer
+1.3  src/stats.py — Historical stats client (NBA.com API)
+
+  • resolve_nba_player_id(canonical_name) -> Optional[int]
+    - Maps canonical player name to NBA.com player ID. Uses nba_api and disk cache.
+
+  • fetch_last_n_games(nba_player_id, n) -> List[Dict]
+    - Async fetch of last N games from NBA.com playergamelog. Cached 24h.
+
+  • get_stat_series(games, stat_type) -> List[float]
+    - Extracts Points, Rebounds, or Assists from game dicts in chronological order.
+
+
+1.4  src/matchup.py — Opponent/matchup adjustment
+
+  • get_team_metrics(team_abbrev) -> Dict[str, float]
+    - Per-team defensive metrics (pts_allowed_per_game, etc.) from LeagueDashOpponentTeamStats.
+    - Cached 24h (team_metrics_cache.json).
+
+  • get_league_avg_metrics() -> Dict[str, float]
+    - League-average defensive metrics for adjustment baseline.
+
+  • get_player_team(nba_player_id) -> Optional[str]
+    - Returns team abbreviation for a player. Used to determine opponent for matchup adjustment.
+
+  • adjust_for_matchup (in projection.py) uses these to adjust PTS/REB/AST projections.
+
+
+1.5  src/projection.py — Historical stat projection engine
+
+  • get_projection_result(player_id, stat_type, historical_values, n_games, method, min_games)
+    - Returns ProjectionResult(mean, stdev, n, confidence). Caller supplies historical_values.
+    - Methods: weighted_average, simple_average, exponential.
+
+  • blend_short_long_result(short_values, long_values, alpha, method, min_games)
+    - Blends short-window and long-window projections with regression alpha.
+
+  • ensemble_projection(short_values, long_values, alpha, method, min_games)
+    - Ensemble of weighted + exponential; returns (ProjectionResult, strategy_means).
+
+  • winsorize(values, pct): clamps to [p5, p95] to reduce outlier impact.
+
+  • adjust_for_matchup(baseline_mean, opponent_metrics, league_avg_metrics, ...)
+    - Adjusts mean based on opponent defensive strength (PTS/REB/AST metrics).
+
+  • ProjectionResult: mean, stdev, n, confidence (insufficient/low/high_variance/ok).
+
+
+1.6  src/optimizer.py — Expected value (+EV) optimizer
 
   • PropEdge
     - player_id, stat_type, provider, market_line, projected, edge,
-      recommended_side (Over/Under/Pass).
-    - edge is defined as (projected - market_line) / market_line.
-  • compute_edge(projected, market_line)
-    - Applies the edge formula and enforces market_line > 0.
-  • rank_props_by_edge(snapshot, get_projection)
-    - Iterates all PropLine objects in a MarketSnapshot.
-    - Uses a ProjectionProvider (e.g. wrapping get_projection) to obtain
-      model projections for each (player_id, stat_type).
-    - Computes edge for each prop and returns a list of PropEdge sorted
-      by edge descending (best value props first).
+      recommended_side (Over/Under/Pass), best_ev (optional).
+    - edge = (projected - market_line) / market_line.
+    - best_ev: max(EV_over, EV_under) when both odds available; else None.
+  • EV-based ranking: American odds -> profit_per_unit; p_over from Normal(mean, stdev);
+    EV = p_win * profit - (1 - p_win) * 1. Optional calibration: p' = clamp(a*p + b, 0, 1).
+  • rank_props_by_edge(snapshot, projection_provider, get_projection_result, calibration_params, ev_threshold)
+    - Uses ProjectionResult (mean, stdev) when available for EV; else falls back to edge.
+    - Sorts by best_ev descending first; non-EV items by |edge|.
+    - ev_threshold filters props below threshold.
 
 
-1.5  src/alerting.py — Real-time alerting (Telegram/Discord)
+1.7  src/alerting.py — Real-time alerting (Telegram/Discord)
 
   • confidence_score(edge): edge as percentage (e.g. 7.5 for 7.5%).
   • format_alert(prop_edge, player_name): message with Player Name, Prop Line,
@@ -117,7 +150,7 @@ improved later for accuracy, robustness, and features.
     so your phone receives a notification when a high-value prop is detected.
 
 
-1.6  src/database.py — Persistence and performance tracking
+1.8  src/database.py — Persistence and performance tracking
 
   • DatabaseManager
     - Connects to primeprop.db (creates if not exists). Uses built-in sqlite3.
@@ -129,24 +162,37 @@ improved later for accuracy, robustness, and features.
   • main.py persists high-value alerts via log_pick after alerting.
 
 
-1.7  main.py — Pre-game CLV pipeline
+1.9  main.py — Pre-game pipeline
 
   • Fetches upcoming NBA events from /v4/sports/basketball_nba/events; filters
     to games that have not started yet (commence_time > now).
   • Creates one OddsApiIngestor per event via
     /v4/sports/basketball_nba/events/{eventId}/odds.
-  • Runs fetch_multi_source_snapshot with all ingestors, rank_props_by_edge,
-    alert_high_value_props, then logs each high-value pick to the database.
-  • Test scripts: test_projection.py, test_optimizer.py, test_database.py,
-    test_alerts.py, radar.py.
+  • Runs fetch_multi_source_snapshot, aggregate_snapshot_by_best_odds.
+  • Builds projections: fetches last N games via stats.fetch_last_n_games,
+    get_stat_series; supports weighted/simple/exponential, blend, ensemble.
+    Optional matchup adjustment (adjust_for_matchup) for PTS/REB/AST.
+  • rank_props_by_edge(projection_provider, lookup_projection_result, calibration_params, ev_threshold).
+  • Displays Top 10 PRE-GAME +EV bets; alert_high_value_props; log_pick.
+  • Test scripts: test_projection.py, test_optimizer.py, test_optimizer_prob.py,
+    test_database.py, test_alerts.py, radar.py. grade_picks.py for grading.
 
 
-1.8  requirements.txt
+1.10  src/grade_picks.py — Grade picks with actual results
 
-  - Pydantic, aiohttp, python-dotenv, thefuzz/RapidFuzz, etc.
-  - Fuzzy matching: e.g. thefuzz and/or RapidFuzz, Levenshtein (see ingest.py
-    imports for actual usage).
-  - Async HTTP: aiohttp (used by ingest.py).
+  • grade_picks(db_path): fetches picks from database, uses stats.fetch_game_result
+    to get actual stat from NBA.com, computes won/lost, updates database.
+
+
+1.11  src/backtest.py — Calibration backtest
+
+  • run_backtest(db_path): fits calibration params from historical graded picks
+    (fit_calibration_from_picks), saves to calibration_params.json.
+
+
+1.12  requirements.txt
+
+  - aiohttp, nba_api, pandas, pydantic, python-dotenv, thefuzz (see ingest.py).
 
 
 --------------------------------------------------------------------------------
@@ -246,16 +292,18 @@ improved later for accuracy, robustness, and features.
 
   Current: The project defines core models (Player, PropLine, MarketSnapshot,
   Game), ingests pre-game NBA odds from The Odds API per-event with async HTTP
-  and fuzzy name matching, projects a single stat value per player/stat using
-  the last 10 games with a weighted or simple average, computes/ranks edge
-  between projections and market lines, recommends Over/Under/Pass, sends
-  Telegram/Discord alerts when |edge| > 5%, and logs high-value picks to
-  SQLite for win-rate tracking (manual grading).
+  and fuzzy name matching, aggregates best odds across books, fetches
+  historical stats from NBA.com (nba_api), projects mean+stdev per player/stat
+  (weighted/simple/exponential, optional blend/ensemble), optionally adjusts
+  for matchup (opponent defensive metrics), computes EV from Normal model +
+  American odds with optional calibration, ranks by best_ev, recommends
+  Over/Under/Pass, displays Top 10 +EV bets, sends Telegram/Discord alerts when
+  |edge| exceeds threshold, and logs high-value picks to SQLite. grade_picks.py
+  grades picks with actual results; backtest.py fits calibration from graded picks.
 
-  Future: Improve projection accuracy with context (opponent, home/away, rest)
-  and better methods (EWMA, regression to mean, backtests). Harden ingest
-  (retries, parsing validation, name-match tuning). Add storage for game logs
-  and snapshots, a small pipeline to compare projections to lines, and tests
-  plus logging so the system is reliable and measurable.
+  Future: Improve projection accuracy with context (home/away, rest, back-to-back)
+  and better methods (regression to mean, backtests). Harden ingest (retries,
+  parsing validation, name-match tuning). Add storage for game logs and
+  snapshots. Tests plus logging for reliability and measurability.
 
 ================================================================================

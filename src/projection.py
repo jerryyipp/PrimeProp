@@ -10,7 +10,29 @@ Optional winsorization (call winsorize(values, pct) with pct e.g. 0.05) clamps t
 import os
 from dataclasses import dataclass
 from math import sqrt
-from typing import Dict, List, Literal, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
+
+# Optional scipy for accurate z; fallback lookup for common interval levels.
+try:
+    from scipy.stats import norm as _norm
+    def _z_for_interval_level(level: float) -> float:
+        """z such that P(-z <= Z <= z) = level (central interval)."""
+        return float(_norm.ppf(0.5 + level / 2.0))
+except ImportError:
+    _Z_LEVEL_LOOKUP = {
+        0.68: 1.00,
+        0.80: 1.282,
+        0.90: 1.645,
+        0.95: 1.960,
+        0.99: 2.576,
+    }
+    def _z_for_interval_level(level: float) -> float:
+        """z for central interval; use lookup for common levels, else nearest."""
+        level = max(0.5, min(0.999, level))
+        if level in _Z_LEVEL_LOOKUP:
+            return _Z_LEVEL_LOOKUP[level]
+        closest = min(_Z_LEVEL_LOOKUP.keys(), key=lambda k: abs(k - level))
+        return _Z_LEVEL_LOOKUP[closest]
 
 # Standard confidence labels for ProjectionResult
 ConfidenceType = Literal["insufficient", "low", "high_variance", "ok"]
@@ -35,6 +57,124 @@ ENSEMBLE_STDEV_FLOOR = 0.5
 
 # Matchup adjustment clamp (max ±6% from baseline; keep safe).
 MATCHUP_DELTA_CLAMP = 0.06
+
+
+def _stdev_env(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)).strip())
+    except (ValueError, TypeError):
+        return default
+
+
+def _small_sample_k_env(default: float = 10.0) -> float:
+    try:
+        return float(os.getenv("SMALL_SAMPLE_K", str(default)).strip())
+    except (ValueError, TypeError):
+        return default
+
+
+def _stdev_inflation_env(default: float = 1.25) -> float:
+    try:
+        return float(os.getenv("STDEV_INFLATION", str(default)).strip())
+    except (ValueError, TypeError):
+        return default
+
+
+def inflate_stdev_for_stat(stat_type: str, stdev: float, n: int) -> float:
+    """
+    Apply variance inflation to a raw stdev based on stat type and sample size.
+
+    Steps (for PTS/REB/AST):
+      - Floor stdev by stat-specific minimum.
+      - Inflate for small samples: stdev *= sqrt((n + K) / max(n, 1)).
+      - Global inflation: stdev *= STDEV_INFLATION.
+    For other stat types (e.g. PRA, Threes), only small-sample + global inflation apply.
+    """
+    if n <= 0:
+        return stdev
+
+    floors = {
+        "Points": _stdev_env("STDEV_FLOOR_POINTS", 3.5),
+        "Rebounds": _stdev_env("STDEV_FLOOR_REBOUNDS", 1.8),
+        "Assists": _stdev_env("STDEV_FLOOR_ASSISTS", 1.5),
+    }
+
+    base = float(stdev)
+    floor = floors.get(stat_type)
+    if floor is not None:
+        base = max(base, floor)
+
+    k = _small_sample_k_env(10.0)
+    if k > 0:
+        base *= sqrt((n + k) / max(n, 1))
+
+    infl = _stdev_inflation_env(1.25)
+    if infl > 0:
+        base *= infl
+    return base
+
+
+def _interval_level_env() -> float:
+    """Projection interval level from env (default 0.80)."""
+    try:
+        return float(os.getenv("PROJECTION_INTERVAL_LEVEL", "0.80").strip())
+    except (ValueError, TypeError):
+        return 0.80
+
+
+def projection_interval(
+    mean: float,
+    stdev: float,
+    level: Optional[float] = None,
+) -> Tuple[float, float]:
+    """
+    Central confidence interval for a normal(mean, stdev) projection.
+    level: probability mass inside the interval (default from PROJECTION_INTERVAL_LEVEL=0.80).
+    Returns (low, high) = mean +/- z*stdev; z from scipy if present else lookup (0.8, 0.9, 0.95).
+    """
+    if level is None:
+        level = _interval_level_env()
+    level = max(0.5, min(0.999, level))
+    z = _z_for_interval_level(level)
+    stdev = max(0.0, stdev)
+    low = mean - z * stdev
+    high = mean + z * stdev
+    return (low, high)
+
+
+# Context adjustment (home/away, rest): read from env with defaults.
+def _context_env(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)).strip())
+    except (ValueError, TypeError):
+        return default
+
+
+def apply_context_adjustments(
+    mean: float,
+    stat_type: str,
+    is_home: bool,
+    rest_days: Optional[int],
+) -> float:
+    """
+    Apply home/away and rest-day multipliers to projection mean (PTS/REB/AST only).
+    - is_home: add HOME_BONUS_PCT (default 0.02).
+    - back-to-back (rest_days == 0): subtract B2B_PENALTY_PCT (default 0.01).
+    - Total adjustment clamped to +/- CONTEXT_ADJUST_CLAMP (default 0.05).
+    stdev is unchanged; caller should keep existing ProjectionResult.stdev.
+    """
+    if stat_type not in ("Points", "Rebounds", "Assists"):
+        return mean
+    home_bonus = _context_env("HOME_BONUS_PCT", 0.02)
+    b2b_penalty = _context_env("B2B_PENALTY_PCT", 0.01)
+    clamp = _context_env("CONTEXT_ADJUST_CLAMP", 0.05)
+    delta = 0.0
+    if is_home:
+        delta += home_bonus
+    if rest_days is not None and rest_days == 0:
+        delta -= b2b_penalty
+    delta = max(-clamp, min(clamp, delta))
+    return mean * (1.0 + delta)
 
 
 def winsorize(values: List[float], pct: float) -> Tuple[List[float], int]:
@@ -122,6 +262,25 @@ class ProjectionResult:
     stdev: float
     n: int
     confidence: ConfidenceType = "ok"
+
+
+def blend_lastN_with_season(
+    last_n_result: "ProjectionResult",
+    season_avg: float,
+    alpha: float,
+) -> ProjectionResult:
+    """
+    Blend last-N projection with season-to-date average.
+    blended_mean = alpha * last_n_mean + (1 - alpha) * season_avg;
+    stdev and n/confidence taken from last_n_result.
+    """
+    blended_mean = alpha * last_n_result.mean + (1.0 - alpha) * season_avg
+    return ProjectionResult(
+        mean=blended_mean,
+        stdev=last_n_result.stdev,
+        n=last_n_result.n,
+        confidence=last_n_result.confidence,
+    )
 
 
 def compute_stdev(values: List[float]) -> float:
@@ -228,6 +387,7 @@ def ensemble_projection(
     values_long: List[float],
     blend_alpha: float = 0.65,
     *,
+    stat_type: StatType,
     min_games: int = 5,
 ) -> Tuple[ProjectionResult | None, Dict[str, float]]:
     """
@@ -250,7 +410,7 @@ def ensemble_projection(
         method = (name or "").strip().lower()
         if method == "blend_short_long":
             res, _ = blend_short_long_result(
-                values_short, values_long, blend_alpha, DEFAULT_METHOD
+                values_short, values_long, blend_alpha, DEFAULT_METHOD, stat_type=stat_type
             )
             if res is not None:
                 means[name] = res.mean
@@ -279,6 +439,7 @@ def ensemble_projection(
     )
     stdev_ens = max(stdev_weighted, ENSEMBLE_STDEV_FLOOR)
     n = len(values_long)
+    stdev_ens = inflate_stdev_for_stat(stat_type, stdev_ens, n)
     confidence = compute_confidence(mean_ens, stdev_ens, n, min_games)
     return (
         ProjectionResult(mean=mean_ens, stdev=stdev_ens, n=n, confidence=confidence),
@@ -292,6 +453,7 @@ def blend_short_long_result(
     alpha: float,
     base_method: str = "weighted_average",
     *,
+    stat_type: StatType,
     min_games: int = 5,
 ) -> tuple[ProjectionResult | None, str]:
     """
@@ -306,6 +468,7 @@ def blend_short_long_result(
     mean = alpha * mean_short + (1.0 - alpha) * mean_long
     stdev = alpha * stdev_short + (1.0 - alpha) * stdev_long
     n = len(long_values)
+    stdev = inflate_stdev_for_stat(stat_type, stdev, n)
     confidence = compute_confidence(mean, stdev, n, min_games)
     return (ProjectionResult(mean=mean, stdev=stdev, n=n, confidence=confidence), "blend_short_long")
 
@@ -347,6 +510,7 @@ def get_projection_result(
 
     stdev = compute_stdev(recent)
     n = len(recent)
+    stdev = inflate_stdev_for_stat(stat_type, stdev, n)
     confidence = compute_confidence(mean, stdev, n, min_games)
     return ProjectionResult(mean=mean, stdev=stdev, n=n, confidence=confidence)
 

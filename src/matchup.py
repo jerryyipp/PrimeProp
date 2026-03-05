@@ -99,17 +99,29 @@ def _ensure_team_metrics_cache() -> None:
     _fetch_and_cache_daily_pts_allowed()
 
 
+_logged_matchup_unavailable = False
+
+
+def _log_matchup_unavailable_once() -> None:
+    global _logged_matchup_unavailable
+    if not _logged_matchup_unavailable:
+        _logged_matchup_unavailable = True
+        print("Matchup metrics unavailable; using neutral adjustment")
+
+
 def _fetch_and_cache_daily_pts_allowed() -> None:
     """
-    Fetch per-team defensive metrics (PTS, REB, AST allowed) from NBA API LeagueDashOpponentTeamStats.
-    PTS = points allowed, REB = rebounds allowed, AST = assists allowed. Compute league averages.
+    Fetch per-team metrics from NBA API LeagueDashTeamStats (PerGame).
+    Uses defensively relevant columns if available; otherwise caches neutral metrics so factor=1.0.
+    Caching and TTL unchanged. Never raises: on failure returns and callers use fallback dicts.
     """
     try:
-        from nba_api.stats.endpoints import leaguedashopponentteamstats
+        from nba_api.stats.endpoints import leaguedashteamstats
 
-        obj = leaguedashopponentteamstats.LeagueDashOpponentTeamStats(season_nullable="2024-25")
+        obj = leaguedashteamstats.LeagueDashTeamStats(per_mode_detailed="PerGame")
         dfs = obj.get_data_frames()
         if not dfs or dfs[0] is None or dfs[0].empty:
+            _log_matchup_unavailable_once()
             return
         df = dfs[0]
         abbrev_col = None
@@ -117,10 +129,40 @@ def _fetch_and_cache_daily_pts_allowed() -> None:
             if c in df.columns:
                 abbrev_col = c
                 break
-        if abbrev_col is None or "PTS" not in df.columns:
+        if abbrev_col is None:
+            _log_matchup_unavailable_once()
             return
-        has_reb = "REB" in df.columns
-        has_ast = "AST" in df.columns
+
+        # LeagueDashTeamStats gives team's own PTS/REB/AST, not "allowed". Look for defensive-style columns if any.
+        defensively_relevant = None
+        for col in ("OPP_PTS", "PTS_ALLOWED", "OPP_PTS_PER_GAME"):
+            if col in df.columns:
+                defensively_relevant = col
+                break
+        # If no defensive column, use neutral: cache league avg for all teams so factor = 1.0
+        if defensively_relevant is None:
+            _log_matchup_unavailable_once()
+            now = datetime.now(timezone.utc)
+            neutral = {
+                "pts_allowed_per_game": DEFAULT_LEAGUE_PTS_ALLOWED,
+                "reb_allowed_per_game": DEFAULT_LEAGUE_REB_ALLOWED,
+                "ast_allowed_per_game": DEFAULT_LEAGUE_AST_ALLOWED,
+            }
+            cache = _load_cache()
+            cache["league_avg"] = {"cached_at": now.isoformat(), "metrics": dict(neutral)}
+            cache["teams"] = {}
+            for _, row in df.iterrows():
+                abbr = str(row[abbrev_col]).strip().upper()
+                if abbr:
+                    cache["teams"][abbr] = {"cached_at": now.isoformat(), "metrics": dict(neutral)}
+            _save_cache(cache)
+            return
+
+        has_reb = "REB" in df.columns or "OPP_REB" in df.columns
+        has_ast = "AST" in df.columns or "OPP_AST" in df.columns
+        pts_col = defensively_relevant
+        reb_col = "OPP_REB" if "OPP_REB" in df.columns else ("REB" if has_reb else None)
+        ast_col = "OPP_AST" if "OPP_AST" in df.columns else ("AST" if has_ast else None)
 
         pts_allowed: Dict[str, float] = {}
         reb_allowed: Dict[str, float] = {}
@@ -130,14 +172,15 @@ def _fetch_and_cache_daily_pts_allowed() -> None:
             if not abbr:
                 continue
             try:
-                pts_allowed[abbr] = float(row["PTS"])
-                if has_reb:
-                    reb_allowed[abbr] = float(row["REB"])
-                if has_ast:
-                    ast_allowed[abbr] = float(row["AST"])
+                pts_allowed[abbr] = float(row[pts_col])
+                if reb_col:
+                    reb_allowed[abbr] = float(row[reb_col])
+                if ast_col:
+                    ast_allowed[abbr] = float(row[ast_col])
             except (TypeError, ValueError, KeyError):
                 continue
         if not pts_allowed:
+            _log_matchup_unavailable_once()
             return
 
         metrics_base: Dict[str, float] = {
@@ -160,8 +203,10 @@ def _fetch_and_cache_daily_pts_allowed() -> None:
                 m["ast_allowed_per_game"] = ast_allowed[abbr]
             cache["teams"][abbr] = {"cached_at": now.isoformat(), "metrics": m}
         _save_cache(cache)
-    except Exception as e:
-        print(f"DEBUG: matchup _fetch_and_cache_daily_pts_allowed failed: {e}")
+    except ImportError:
+        _log_matchup_unavailable_once()
+    except Exception:
+        _log_matchup_unavailable_once()
 
 
 def get_team_metrics(team_abbrev: str) -> Dict[str, float]:
