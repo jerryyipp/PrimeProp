@@ -1,9 +1,9 @@
 """
 Backtest graded picks: hit rate, Brier score, log loss, calibration bin report (avg predicted vs actual hit rate),
-EV vs realized profit. Use --fit to fit and save calibration (a, b).
+EV vs realized profit. Use --fit-calibration to fit and save calibration (a, b) and print before/after Brier/logloss.
 
 Run from project root: python -m src.backtest
-Or from src/: python backtest.py (adds project root to path).
+Or: python -m src.backtest --fit-calibration
 """
 
 import sys
@@ -17,7 +17,13 @@ if _root not in sys.path:
     sys.path.insert(0, str(_root))
 
 from src.database import DatabaseManager
-from src.optimizer import profit_per_unit
+from src.optimizer import (
+    profit_per_unit,
+    fit_calibration_from_picks,
+    save_calibration,
+    DEFAULT_CALIBRATION_PATH,
+    _clamp_calibrated,
+)
 
 
 # Bins for model probability (Over): (low, high) in [0, 1]
@@ -134,18 +140,45 @@ def run_backtest(db_path: Optional[Path] = None) -> None:
     print(f"  Difference (EV − realized): {total_ev - total_realized:.4f}")
 
 
-if __name__ == "__main__":
-    import sys
-    from src.optimizer import fit_calibration_from_picks, save_calibration, DEFAULT_CALIBRATION_PATH
+def _brier_and_logloss(p_win_outcomes: list[tuple[float, int]]) -> tuple[float, float]:
+    """Brier score and log loss from list of (p_win, outcome). Returns (brier, logloss)."""
+    if not p_win_outcomes:
+        return (0.0, 0.0)
+    n = len(p_win_outcomes)
+    eps = 1e-15
+    brier = sum((p - y) ** 2 for p, y in p_win_outcomes) / n
+    logloss = -sum(
+        y * math.log(max(p, eps)) + (1 - y) * math.log(max(1 - p, eps))
+        for p, y in p_win_outcomes
+    ) / n
+    return (brier, logloss)
 
-    if "--fit" in sys.argv:
+
+if __name__ == "__main__":
+    if "--fit-calibration" in sys.argv:
         db = DatabaseManager()
         rows = db.get_graded_picks()
         db.close()
         if len(rows) < 10:
-            print("Need at least 10 graded picks to fit calibration. Run backtest without --fit first.")
+            print("Need at least 10 graded picks to fit calibration. Run backtest without --fit-calibration first.")
         else:
+            # Build (p_win, outcome) for each pick
+            p_win_outcomes: list[tuple[float, int]] = []
+            for r in rows:
+                p_win = _p_win_for_pick(r)
+                if p_win is None:
+                    continue
+                outcome = 1 if r["won"] == 1 else 0
+                p_win_outcomes.append((float(p_win), outcome))
+            brier_before, logloss_before = _brier_and_logloss(p_win_outcomes)
+            print("Before calibration: Brier = {:.4f}, Log loss = {:.4f}".format(brier_before, logloss_before))
+
             a, b = fit_calibration_from_picks(rows)
             save_calibration(DEFAULT_CALIBRATION_PATH, a, b)
-            print(f"Fitted calibration a={a:.4f}, b={b:.4f} -> saved to {DEFAULT_CALIBRATION_PATH}")
+            print("Fitted calibration a={:.4f}, b={:.4f} -> saved to {2}".format(a, b, DEFAULT_CALIBRATION_PATH))
+
+            # After: p' = clamp(a*p + b, 0, 1)
+            p_cal_outcomes = [(_clamp_calibrated(p, a, b), y) for p, y in p_win_outcomes]
+            brier_after, logloss_after = _brier_and_logloss(p_cal_outcomes)
+            print("After calibration:  Brier = {:.4f}, Log loss = {:.4f}".format(brier_after, logloss_after))
     run_backtest()

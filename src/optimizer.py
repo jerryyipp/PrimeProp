@@ -18,7 +18,7 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Literal, Tuple
+from typing import Any, Callable, List, Optional, Literal, Tuple, Union
 
 from pydantic import BaseModel, Field
 
@@ -146,11 +146,25 @@ def load_calibration(path: Path) -> Optional[Tuple[float, float]]:
         return None
 
 
+def load_calibration_params(path: Union[str, Path, None] = None) -> Optional[Tuple[float, float]]:
+    """
+    Load calibration (a, b) from JSON for use in EV. Default path: calibration_params.json in project root.
+    Returns None if file missing or invalid.
+    """
+    p = DEFAULT_CALIBRATION_PATH if path is None else (Path(path) if isinstance(path, str) else path)
+    return load_calibration(p)
+
+
 def save_calibration(path: Path, a: float, b: float) -> None:
-    """Write calibration params to JSON."""
+    """Write calibration params to JSON with updated_at (ISO)."""
+    from datetime import datetime, timezone
     try:
         with path.open("w", encoding="utf-8") as f:
-            json.dump({"a": a, "b": b}, f, indent=2)
+            json.dump({
+                "a": a,
+                "b": b,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }, f, indent=2)
     except OSError:
         pass
 
@@ -269,15 +283,7 @@ def rank_props_by_edge(
     ranked: List[PropEdge] = []
     rec_threshold = ev_threshold if ev_threshold is not None else 0.02
 
-    # Load calibration params from disk if not supplied.
-    if calibration_params is None:
-        calibration_params = load_calibration(DEFAULT_CALIBRATION_PATH)
-    if calibration_params is not None:
-        a, b = calibration_params
-        print(f"Calibration: a={a:.4f}, b={b:.4f}")
-    else:
-        print("Calibration: none")
-
+    # Calibration (a, b) applied to p_over before EV when supplied by caller; main.py loads and logs.
     p_min, p_max = _prob_bounds_from_env()
 
     for line in snapshot.lines:

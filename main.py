@@ -23,7 +23,7 @@ from src.ingest import (
 )
 from src.alerting import alert_high_value_props
 from src.models import MarketSnapshot, Player
-from src.optimizer import rank_props_by_edge
+from src.optimizer import load_calibration_params, rank_props_by_edge
 from src.projection import (
     ProjectionResult,
     get_projection_result as compute_projection_result,
@@ -330,10 +330,18 @@ async def run_ranking_for_snapshot(
         entry = projected.get((pid, st), (None, None))
         return entry[1]
 
+    calibration_params = load_calibration_params()
+    if calibration_params is not None:
+        a, b = calibration_params
+        print("Calibration: a={:.4f}, b={:.4f}".format(a, b))
+    else:
+        print("Calibration: none")
+
     ranked = rank_props_by_edge(
         snapshot,
         get_projection,
         get_projection_result=lookup_projection_result,
+        calibration_params=calibration_params,
         ev_threshold=ev_threshold,
     )
     ranked = _enrich_ranked_with_line_movement(ranked, open_lines)
@@ -423,6 +431,34 @@ async def main() -> None:
             or (e.recommended_side == "Under" and (e.delta_line if e.delta_line is not None else delta_default) > 0)
         ]
         print(f"DEBUG: Filtered to {len(ranked)} props with line movement in our favor (REQUIRE_LINE_MOVEMENT_WITH_US=1).")
+
+    # Confidence-based filter: exclude high_variance by default; allow only if INCLUDE_HIGH_VARIANCE=1 and best_ev >= HIGH_VARIANCE_MIN_EV
+    include_high_variance = _env_int("INCLUDE_HIGH_VARIANCE", 0)
+    high_variance_min_ev = _env_float("HIGH_VARIANCE_MIN_EV", 0.08)
+    excluded_high_variance = 0
+    included_high_variance_due_to_ev = 0
+
+    def _confidence_for_edge(edge: Any) -> str:
+        res = projected.get((edge.player_id, edge.stat_type), (None, None))[1]
+        return getattr(res, "confidence", "ok") if res else "ok"
+
+    filtered_ranked: List[Any] = []
+    for e in ranked:
+        conf = _confidence_for_edge(e)
+        if conf != "high_variance":
+            filtered_ranked.append(e)
+            continue
+        if include_high_variance == 0:
+            excluded_high_variance += 1
+            continue
+        best_ev = getattr(e, "best_ev", None)
+        if best_ev is not None and best_ev >= high_variance_min_ev:
+            filtered_ranked.append(e)
+            included_high_variance_due_to_ev += 1
+        else:
+            excluded_high_variance += 1
+    ranked = filtered_ranked
+    print(f"High-variance filter: excluded_high_variance={excluded_high_variance}, included_high_variance_due_to_ev={included_high_variance_due_to_ev}")
 
     # Top N (EV ranking): mean±stdev, EV, book/odds, confidence label
     top_n = 10
