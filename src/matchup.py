@@ -1,9 +1,8 @@
 """
 Opponent/matchup adjustment: team metrics cache and player team resolution.
 
-Provides daily-cached per-team defensive metric (points allowed per game, true
-opponent metric) and league average for projection adjustment. get_opponent_points_factor(team)
-returns a multiplier around 1.0 for scoring adjustment.
+Provides daily-cached per-team defensive metric (points allowed per game) and
+league average for projection adjustment via projection.adjust_for_matchup().
 """
 
 import json
@@ -238,23 +237,6 @@ def get_league_avg_metrics() -> Dict[str, float]:
         m = entry.get("metrics", {})
         return {k: v for k, v in m.items() if k in ("pts_allowed_per_game", "reb_allowed_per_game", "ast_allowed_per_game")}
     return {"pts_allowed_per_game": DEFAULT_LEAGUE_PTS_ALLOWED}
-
-
-def get_opponent_points_factor(team: str) -> float:
-    """
-    Multiplier around 1.0 for scoring vs this opponent.
-    factor = league_avg_pts_allowed / opponent_pts_allowed.
-    > 1 = easier matchup (opponent allows more); < 1 = tougher. Returns 1.0 if unknown.
-    """
-    if not team or not team.strip():
-        return 1.0
-    _ensure_team_metrics_cache()
-    league_avg = get_league_avg_metrics().get("pts_allowed_per_game") or DEFAULT_LEAGUE_PTS_ALLOWED
-    opponent_metrics = get_team_metrics(team)
-    opponent_pts = opponent_metrics.get("pts_allowed_per_game") or league_avg
-    if opponent_pts <= 0:
-        return 1.0
-    return league_avg / opponent_pts
 
 
 def get_player_team(nba_player_id: int) -> Optional[str]:

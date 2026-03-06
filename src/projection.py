@@ -293,6 +293,16 @@ def compute_stdev(values: List[float]) -> float:
     return sqrt(variance)
 
 
+def compute_per_minute_rate(values: List[float], minutes: List[float]) -> List[float]:
+    """
+    Per-minute rate for each game: rate_i = value_i / max(min_i, 1).
+    lengths of values and minutes must match; only pairs with min_i > 0 are sensible.
+    """
+    if len(values) != len(minutes):
+        return []
+    return [v / max(m, 1.0) for v, m in zip(values, minutes)]
+
+
 def _linear_weights(n: int) -> List[float]:
     """
     Weights for last n games: index 0 = oldest (lowest), index n-1 = newest (highest).
@@ -379,6 +389,41 @@ def _compute_mean_and_stdev(
         mean = compute_weighted_average(values)
     stdev = compute_stdev(values)
     return (mean, stdev)
+
+
+def _minutes_aware_projection(
+    values: List[float],
+    minutes: List[float],
+    method: str,
+    stat_type: StatType,
+    n_games: int,
+    min_games: int,
+) -> ProjectionResult | None:
+    """
+    Minutes-aware projection: stat_total = minutes * per_minute_rate.
+    mean = mean_rate * mean_minutes; stdev via error propagation, then floors + inflation.
+    """
+    if len(values) != len(minutes) or len(values) < min_games:
+        return None
+    recent_v = values[-n_games:] if len(values) > n_games else values
+    recent_m = minutes[-n_games:] if len(minutes) > n_games else minutes
+    if len(recent_v) != len(recent_m) or len(recent_v) < min_games:
+        return None
+
+    rates = compute_per_minute_rate(recent_v, recent_m)
+    mean_rate, stdev_rate = _compute_mean_and_stdev(rates, method)
+    mean_minutes = compute_simple_average(recent_m)
+    stdev_minutes = compute_stdev(recent_m)
+
+    projected_mean = mean_rate * mean_minutes
+    # Error propagation: total = rate * mins => var(total) ≈ (mean_mins*stdev_rate)^2 + (mean_rate*stdev_mins)^2
+    projected_stdev_raw = sqrt(
+        (stdev_rate * mean_minutes) ** 2 + (mean_rate * stdev_minutes) ** 2
+    )
+    n = len(recent_v)
+    projected_stdev = inflate_stdev_for_stat(stat_type, projected_stdev_raw, n)
+    confidence = compute_confidence(projected_mean, projected_stdev, n, min_games)
+    return ProjectionResult(mean=projected_mean, stdev=projected_stdev, n=n, confidence=confidence)
 
 
 def ensemble_projection(
@@ -478,25 +523,44 @@ def get_projection_result(
     stat_type: StatType,
     historical_values: List[float],
     *,
+    historical_minutes: Optional[List[float]] = None,
     n_games: int = 10,
     method: Literal["weighted_average", "simple_average", "exponential", "blend_short_long"] = "weighted_average",
     min_games: int = 5,
 ) -> ProjectionResult | None:
     """
     Returns a ProjectionResult (mean, stdev, n, confidence) for the player's recent history.
-    Returns None if no historical data. Uses same method logic as get_projection.
-    For blend_short_long, historical_values should be long window; short is derived by caller.
+    When historical_minutes is provided (aligned with historical_values), uses minutes-aware
+    projection: projected_mean = mean_rate * mean_minutes, stdev via error propagation, then floors + inflation.
+    For blend_short_long, caller must use blend_short_long_result directly.
     """
     if stat_type not in STAT_TYPES:
         raise ValueError(f"stat_type must be one of {STAT_TYPES}, got {stat_type!r}")
 
     method = _normalize_method(method)
-    recent = historical_values[-n_games:] if len(historical_values) > n_games else historical_values
-    if not recent:
-        return None
 
     if method == "blend_short_long":
-        # Caller must use blend_short_long_result directly with short/long values
+        return None
+
+    # Minutes-aware path when minutes series is provided and aligned
+    if (
+        historical_minutes is not None
+        and len(historical_minutes) == len(historical_values)
+        and len(historical_values) >= min_games
+    ):
+        res = _minutes_aware_projection(
+            historical_values,
+            historical_minutes,
+            method,
+            stat_type,
+            n_games,
+            min_games,
+        )
+        if res is not None:
+            return res
+
+    recent = historical_values[-n_games:] if len(historical_values) > n_games else historical_values
+    if not recent:
         return None
 
     if method == "weighted_average":

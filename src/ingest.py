@@ -56,8 +56,12 @@ def _ingest_max_retries() -> int:
         return 3
 
 
-# PropLine only accepts Points/Rebounds/Assists; filter to these when building lines.
-ALLOWED_STAT_TYPES = ("Points", "Rebounds", "Assists")
+# PropLine stat types: core + optional PRA/Threes when ENABLE_EXTRA_MARKETS=true (sync with projection.STAT_TYPES).
+def get_allowed_stat_types() -> Tuple[str, ...]:
+    core = ("Points", "Rebounds", "Assists")
+    if os.getenv("ENABLE_EXTRA_MARKETS", "").strip().lower() in ("1", "true", "yes"):
+        return core + ("PRA", "Threes")
+    return core
 
 
 def _stable_id(canonical_name: str) -> str:
@@ -278,7 +282,7 @@ class OddsApiIngestor(ProviderIngestor):
                 for market in markets:
                     market_key = market.get("key")
                     stat_type = STAT_TYPE_KEY_MAP.get(market_key)
-                    if stat_type is None or stat_type not in ALLOWED_STAT_TYPES:
+                    if stat_type is None or stat_type not in get_allowed_stat_types():
                         continue
 
                     outcomes = market.get("outcomes", [])
@@ -401,7 +405,7 @@ class PrizePicksIngestor(ProviderIngestor):
 
             stat_key = str(stat_raw).lower()
             stat_type = STAT_TYPE_NAME_MAP.get(stat_key)
-            if stat_type is None or stat_type not in ALLOWED_STAT_TYPES:
+            if stat_type is None or stat_type not in get_allowed_stat_types():
                 continue
 
             line_score = attributes.get("line_score")
@@ -447,7 +451,7 @@ async def fetch_multi_source_snapshot(
     matcher = FuzzyNameMatcher(players, counters=counters)
     timeout_s = _ingest_timeout_s()
     cb_max = _ingest_cb_max_failures()
-    # Per bookmaker (provider_name) failure count; after cb_max we skip that bookmaker for the rest of the run.
+    # Per-provider-instance failure count (key = url or provider_name + index so events are isolated).
     circuit_failures: Dict[str, int] = {}
 
     timeout = aiohttp.ClientTimeout(total=timeout_s)
@@ -457,18 +461,19 @@ async def fetch_multi_source_snapshot(
         for i, provider in enumerate(providers):
             if i > 0 and event_delay_s > 0:
                 await asyncio.sleep(event_delay_s)
-            name = getattr(provider, "provider_name", "unknown")
-            if circuit_failures.get(name, 0) >= cb_max:
-                print(f"WARNING: Ingest skipping {name!r} (circuit breaker open after {cb_max} failures).")
+            # Key by URL when available (e.g. OddsApiIngestor per event) so one failed event doesn't trip the whole slate.
+            circuit_key = getattr(provider, "url", None) or f"{getattr(provider, 'provider_name', 'unknown')}_{i}"
+            if circuit_failures.get(circuit_key, 0) >= cb_max:
+                print(f"WARNING: Ingest skipping {circuit_key!r} (circuit breaker open after {cb_max} failures).")
                 results.append([])
                 continue
             try:
                 lines = await provider.fetch_lines(session, matcher)
                 results.append(lines if isinstance(lines, list) else [])
-            except Exception as e:
-                circuit_failures[name] = circuit_failures.get(name, 0) + 1
-                if circuit_failures[name] >= cb_max:
-                    print(f"WARNING: Ingest circuit breaker open for {name!r} after {cb_max} failures; skipping for remainder of run.")
+            except Exception:
+                circuit_failures[circuit_key] = circuit_failures.get(circuit_key, 0) + 1
+                if circuit_failures[circuit_key] >= cb_max:
+                    print(f"WARNING: Ingest circuit breaker open for {circuit_key!r} after {cb_max} failures; skipping for remainder of run.")
                 results.append([])
 
     all_lines: List[PropLine] = []
@@ -506,14 +511,13 @@ def aggregate_snapshot_by_best_odds(
     output one aggregated PropLine per group. If stat_types is set (e.g. PTS/REB/AST),
     only lines with that stat_type are included in the result; otherwise all.
     """
-    key_type = Tuple[str, str, float]  # (player_id, stat_type, threshold)
     allowed = set(stat_types) if stat_types is not None else None
-    grouped: Dict[key_type, List[PropLine]] = {}
+    grouped: Dict[Tuple[str, str, float], List[PropLine]] = {}
 
     for line in snapshot.lines:
         if allowed is not None and line.stat_type not in allowed:
             continue
-        key: key_type = (line.player_id, line.stat_type, line.threshold)
+        key = (line.player_id, line.stat_type, line.threshold)
         grouped.setdefault(key, []).append(line)
 
     aggregated_lines: List[PropLine] = []

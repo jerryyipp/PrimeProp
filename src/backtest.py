@@ -70,17 +70,24 @@ def run_backtest(db_path: Optional[Path] = None) -> None:
         print("No graded picks (won IS NOT NULL). Grade picks to run backtest.")
         return
 
-    n = len(rows)
-    wins = sum(1 for r in rows if r["won"] == 1)
+    # Exclude pushes (won == -1) from wins/losses and hit rate
+    settled = [r for r in rows if r["won"] in (0, 1)]
+    n = len(settled)
+    if n == 0:
+        print("No settled picks (all pushes). Grade picks to run backtest.")
+        return
+    wins = sum(1 for r in settled if r["won"] == 1)
     hit_rate_pct = round(wins / n * 100.0, 2)
-    print("--- Backtest (graded picks only) ---")
+    print("--- Backtest (graded picks only, pushes excluded) ---")
     print(f"Overall: n={n}, wins={wins}, hit rate={hit_rate_pct}%")
 
-    # Brier score and log loss (picks with p_win)
+    # Brier score and log loss (picks with p_win; exclude pushes)
     p_win_outcomes: list[tuple[float, int]] = []
-    for r in rows:
+    for r in settled:
         p_win = _p_win_for_pick(r)
         if p_win is None:
+            continue
+        if r["won"] == -1:
             continue
         outcome = 1 if r["won"] == 1 else 0
         p_win_outcomes.append((p_win, outcome))
@@ -99,9 +106,11 @@ def run_backtest(db_path: Optional[Path] = None) -> None:
     print("\nCalibration bins (avg predicted vs actual hit rate):")
     for low, high in P_OVER_BINS:
         in_bin = []
-        for r in rows:
+        for r in settled:
             p_win = _p_win_for_pick(r)
             if p_win is None:
+                continue
+            if r["won"] == -1:
                 continue
             if low <= p_win < high:
                 in_bin.append(r)
@@ -117,7 +126,9 @@ def run_backtest(db_path: Optional[Path] = None) -> None:
     total_ev = 0.0
     total_realized = 0.0
     used = 0
-    for r in rows:
+    for r in settled:
+        if r["won"] == -1:
+            continue
         p_win = _p_win_for_pick(r)
         try:
             odds = r["odds"] if "odds" in r.keys() else None
@@ -133,7 +144,7 @@ def run_backtest(db_path: Optional[Path] = None) -> None:
         total_realized += won * profit - (1 - won) * 1.0
         used += 1
 
-    print("\nExpected EV (model) vs realized profit (actual), per $1 stake:")
+    print("\nExpected EV (model) vs realized profit (actual), per $1 stake (pushes excluded):")
     print(f"  Picks used: {used} / {n}")
     print(f"  Sum expected EV:   {total_ev:.4f}")
     print(f"  Sum realized:      {total_realized:.4f}")
@@ -162,9 +173,11 @@ if __name__ == "__main__":
         if len(rows) < 10:
             print("Need at least 10 graded picks to fit calibration. Run backtest without --fit-calibration first.")
         else:
-            # Build (p_win, outcome) for each pick
+            # Build (p_win, outcome) for each pick (exclude pushes)
             p_win_outcomes: list[tuple[float, int]] = []
             for r in rows:
+                if r["won"] == -1:
+                    continue
                 p_win = _p_win_for_pick(r)
                 if p_win is None:
                     continue
@@ -175,7 +188,7 @@ if __name__ == "__main__":
 
             a, b = fit_calibration_from_picks(rows)
             save_calibration(DEFAULT_CALIBRATION_PATH, a, b)
-            print("Fitted calibration a={:.4f}, b={:.4f} -> saved to {2}".format(a, b, DEFAULT_CALIBRATION_PATH))
+            print(f"Fitted calibration a={a:.4f}, b={b:.4f} -> saved to {DEFAULT_CALIBRATION_PATH}")
 
             # After: p' = clamp(a*p + b, 0, 1)
             p_cal_outcomes = [(_clamp_calibrated(p, a, b), y) for p, y in p_win_outcomes]

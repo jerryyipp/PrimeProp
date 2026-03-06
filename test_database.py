@@ -19,10 +19,11 @@ def main():
         db._conn.execute("UPDATE picks SET actual_result = 15.0, won = 1 WHERE player_name = 'Nikola Jokic'")
 
     print("\n--- Performance Tracking ---")
-    total, wins, losses, win_pct = db.get_win_rate()
+    total, wins, losses, pushes, win_pct = db.get_win_rate()
     print(f"Total Graded Picks: {total}")
     print(f"Wins: {wins}")
     print(f"Losses: {losses}")
+    print(f"Pushes: {pushes}")
     print(f"Win Rate: {win_pct}%")
 
 

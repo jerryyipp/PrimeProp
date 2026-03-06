@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional, Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -37,7 +37,7 @@ class PropLine(BaseModel):
 
 class MarketSnapshot(BaseModel):
     snapshot_id: str = Field(...)
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     game_id: str = Field(...)
     lines: List[PropLine] = Field(default_factory=list)
 

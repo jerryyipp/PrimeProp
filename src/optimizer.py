@@ -29,6 +29,7 @@ from .projection import StatType, ProjectionResult
 # Projections are supplied by the caller, typically backed by historical stats.
 ProjectionProvider = Callable[[str, StatType], Optional[float]]
 ProjectionResultProvider = Callable[[str, StatType], Optional[ProjectionResult]]
+LastNValuesProvider = Callable[[str, StatType], Optional[List[float]]]
 
 # Default path for calibration params (project root)
 DEFAULT_CALIBRATION_PATH = Path(__file__).resolve().parent.parent / "calibration_params.json"
@@ -58,6 +59,33 @@ def model_prob_over(line: float, mean: float, stdev: float) -> float:
 def p_over_model(line: float, mean: float, stdev: float) -> float:
     """P(stat > line) from Normal(mean, stdev). 1/0/0.5 when stdev < 1e-6. Alias for model_prob_over."""
     return model_prob_over(line, mean, stdev)
+
+
+def _prob_method_env() -> str:
+    """PROB_METHOD: normal (default) or empirical."""
+    return (os.getenv("PROB_METHOD", "normal") or "normal").strip().lower()
+
+
+def _empirical_smoothing_env() -> float:
+    """EMPIRICAL_SMOOTHING for Laplace-style smoothing (default 1.0)."""
+    try:
+        return float(os.getenv("EMPIRICAL_SMOOTHING", "1.0").strip())
+    except (ValueError, TypeError):
+        return 1.0
+
+
+def empirical_prob_over(line: float, values: List[float], smoothing: float = 1.0) -> float:
+    """
+    P(stat > line) from empirical CDF with Laplace smoothing.
+    p_over = (count(values > line) + smoothing) / (n + 2*smoothing).
+    Clamped to [0, 1].
+    """
+    if not values:
+        return 0.5
+    n = len(values)
+    count_over = sum(1 for v in values if v > line)
+    p = (count_over + smoothing) / (n + 2.0 * smoothing)
+    return max(0.0, min(1.0, p))
 
 
 def profit_per_unit(odds: Optional[float]) -> Optional[float]:
@@ -189,8 +217,8 @@ def fit_calibration_from_picks(rows: List[Any]) -> Tuple[float, float]:
             continue
         side = (_get(r, "recommended_side") or "").strip()
         won = _get(r, "won")
-        if won is None:
-            continue
+        if won is None or won == -1:
+            continue  # skip ungraded and pushes (void)
         if side == "Over":
             p_win = float(p_over)
         elif side == "Under":
@@ -257,6 +285,7 @@ def rank_props_by_edge(
     snapshot: MarketSnapshot,
     get_projection: ProjectionProvider,
     get_projection_result: Optional[ProjectionResultProvider] = None,
+    get_last_n_values: Optional[LastNValuesProvider] = None,
     calibration_params: Optional[Tuple[float, float]] = None,
     ev_threshold: Optional[float] = None,
 ) -> List[PropEdge]:
@@ -282,6 +311,8 @@ def rank_props_by_edge(
     """
     ranked: List[PropEdge] = []
     rec_threshold = ev_threshold if ev_threshold is not None else 0.02
+    prob_method = _prob_method_env()
+    empirical_smoothing = _empirical_smoothing_env()
 
     # Calibration (a, b) applied to p_over before EV when supplied by caller; main.py loads and logs.
     p_min, p_max = _prob_bounds_from_env()
@@ -304,9 +335,18 @@ def rank_props_by_edge(
         projected_stdev_val: Optional[float] = None
         result = get_projection_result(line.player_id, line.stat_type) if get_projection_result else None
         if result is not None:
-            p_over_model_val = model_prob_over(line.threshold, result.mean, result.stdev)
-            p_under_model_val = 1.0 - p_over_model_val
             projected_stdev_val = result.stdev
+            if prob_method == "empirical" and get_last_n_values is not None:
+                last_n = get_last_n_values(line.player_id, line.stat_type)
+                if last_n:
+                    p_over_model_val = empirical_prob_over(line.threshold, last_n, empirical_smoothing)
+                    p_under_model_val = 1.0 - p_over_model_val
+                else:
+                    p_over_model_val = model_prob_over(line.threshold, result.mean, result.stdev)
+                    p_under_model_val = 1.0 - p_over_model_val
+            else:
+                p_over_model_val = model_prob_over(line.threshold, result.mean, result.stdev)
+                p_under_model_val = 1.0 - p_over_model_val
 
         ev_over_val: Optional[float] = None
         ev_under_val: Optional[float] = None
@@ -405,17 +445,15 @@ def rank_props_by_edge(
             return item.edge >= ev_threshold
         ranked = [e for e in ranked if _passes_filter(e)]
 
-    # Sort: EV items first (higher best_ev ranks higher), then non-EV by |edge|
+    # Sort: EV bets first (higher best_ev first), then non-Pass by |edge|, then Pass last
     def _sort_key(item: PropEdge) -> tuple:
+        if item.recommended_side == "Pass":
+            return (2, 0)  # Pass always below any EV or edge bet
         ev = item.best_ev
         if ev is not None:
-            return (0, -ev)  # (0,...) sorts before (1,...); -ev gives higher EV first
+            return (0, -ev)
         return (1, -abs(item.edge))
 
     ranked.sort(key=_sort_key)
-    ev_items = [e for e in ranked if e.best_ev is not None]
-    if ev_items:
-        max_ev = max(e.best_ev for e in ev_items)
-        assert ranked[0].best_ev == max_ev, "ranked[0] must be highest best_ev when EV items exist"
     return ranked
 

@@ -50,6 +50,7 @@ def format_alert(
         p_model = prop_edge.p_under_model
     p_str = f"P(model)={p_model:.2f}" if p_model is not None else "P(model)=—"
     ev_str = f"best_ev={prop_edge.best_ev * 100:.2f}%" if prop_edge.best_ev is not None else "best_ev=—"
+    conf_pct = confidence_score(prop_edge.edge)
     side_str = prop_edge.recommended_side
     odds_str = f"{prop_edge.recommended_odds:+.0f}" if prop_edge.recommended_odds is not None else "—"
     book_str = prop_edge.recommended_provider or prop_edge.provider or "—"
@@ -68,7 +69,7 @@ def format_alert(
         f"Player: {name}\n"
         f"Line: {prop_edge.stat_type} {line_val}\n"
         f"Proj: {mean_s}\n"
-        f"{p_str} | {ev_str}\n"
+        f"{p_str} | {ev_str} | Confidence: {conf_pct}%\n"
         f"Side: {side_str} | Odds: {odds_str} | Book: {book_str}"
         f"{line_move_str}"
     )

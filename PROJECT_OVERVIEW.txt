@@ -157,7 +157,7 @@ improved later for accuracy, robustness, and features.
     - Table picks: id, timestamp, player_name, stat_type, market_line,
       projected, edge, recommended_side, actual_result (NULL), won (NULL).
     - log_pick(...): inserts a pre-game pick with current UTC timestamp.
-    - get_win_rate(): returns (total_graded, wins, losses, win_pct). Only
+    - get_win_rate(): returns (total_graded, wins, losses, pushes, win_pct). Only
       counts rows where won IS NOT NULL; returns (0,0,0,0.0) when none graded.
   • main.py persists high-value alerts via log_pick after alerting.
 

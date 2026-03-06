@@ -43,12 +43,20 @@ def _game_date_from_pick_timestamp(timestamp_str: str) -> Optional[datetime]:
 
 
 def _compute_won(actual: float, market_line: float, recommended_side: str) -> int:
-    """Over: win if actual > line; Under: win if actual < line; else loss (push treated as loss)."""
+    """Over: win if actual > line; Under: win if actual < line; push (actual == line) = -1 (void); else loss = 0."""
     side = (recommended_side or "").strip()
     if side == "Over":
-        return 1 if actual > market_line else 0
+        if actual > market_line:
+            return 1
+        if actual == market_line:
+            return -1
+        return 0
     if side == "Under":
-        return 1 if actual < market_line else 0
+        if actual < market_line:
+            return 1
+        if actual == market_line:
+            return -1
+        return 0
     return 0
 
 
@@ -119,7 +127,8 @@ def grade_picks(
         try:
             db.update_pick_result(pick_id, actual, won)
             graded += 1
-            logger.info("Graded pick id=%s: %s %s %s line=%.1f actual=%.1f -> %s", pick_id, player_name, stat_type, recommended_side, market_line, actual, "WIN" if won else "LOSS")
+            outcome = "WIN" if won == 1 else ("PUSH" if won == -1 else "LOSS")
+            logger.info("Graded pick id=%s: %s %s %s line=%.1f actual=%.1f -> %s", pick_id, player_name, stat_type, recommended_side, market_line, actual, outcome)
         except Exception as e:
             logger.exception("Pick id=%s: update_pick_result failed: %s", pick_id, e)
             errors += 1

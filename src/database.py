@@ -64,7 +64,7 @@ class DatabaseManager:
                 over_provider TEXT,
                 under_provider TEXT,
                 actual_result REAL,
-                won INTEGER
+                won INTEGER  /* 1=win, 0=loss, -1=push (void) */
             )
             """
         )
@@ -172,13 +172,14 @@ class DatabaseManager:
         )
         self._conn.commit()
 
-    def get_win_rate(self) -> tuple[int, int, int, float]:
+    def get_win_rate(self) -> tuple[int, int, int, int, float]:
         """
         Compute stats over graded picks only (rows where won IS NOT NULL).
 
         Returns:
-            (total_graded, wins, losses, win_pct).
-            win_pct is 0.0 when there are no graded picks (avoids ZeroDivisionError).
+            (total_graded, wins, losses, pushes, win_pct).
+            total_graded = wins + losses + pushes. win_pct = wins / (wins + losses), so pushes
+            are excluded from the denominator. win_pct is 0.0 when there are no settled picks.
         """
         assert self._conn is not None
         cur = self._conn.execute(
@@ -186,7 +187,8 @@ class DatabaseManager:
             SELECT
                 COUNT(*) AS total,
                 SUM(CASE WHEN won = 1 THEN 1 ELSE 0 END) AS wins,
-                SUM(CASE WHEN won = 0 THEN 1 ELSE 0 END) AS losses
+                SUM(CASE WHEN won = 0 THEN 1 ELSE 0 END) AS losses,
+                SUM(CASE WHEN won = -1 THEN 1 ELSE 0 END) AS pushes
             FROM picks
             WHERE won IS NOT NULL
             """
@@ -195,12 +197,14 @@ class DatabaseManager:
         total = row["total"] or 0
         wins = row["wins"] or 0
         losses = row["losses"] or 0
-        if total == 0:
-            return (0, 0, 0, 0.0)
-        return (total, wins, losses, round(wins / total * 100.0, 2))
+        pushes = row["pushes"] or 0
+        settled = wins + losses
+        if settled == 0:
+            return (total, wins, losses, pushes, 0.0)
+        return (total, wins, losses, pushes, round(wins / settled * 100.0, 2))
 
     def get_graded_picks(self) -> list[sqlite3.Row]:
-        """Return all picks with won IS NOT NULL (for backtest and calibration)."""
+        """Return all picks with won IS NOT NULL (for backtest and calibration). won: 1=win, 0=loss, -1=push."""
         assert self._conn is not None
         cur = self._conn.execute(
             """
@@ -217,8 +221,9 @@ class DatabaseManager:
 
     def get_ungraded_picks(self, before_datetime: datetime) -> list[PickRow]:
         """
-        Return picks where actual_result IS NULL and timestamp < before_datetime.
+        Return picks where won IS NULL and timestamp < before_datetime.
         Used by auto-grading: only consider picks old enough that the game has been played.
+        won IS NULL is the canonical ungraded signal; actual_result is a bonus field.
         """
         assert self._conn is not None
         before_str = before_datetime.isoformat()
@@ -229,7 +234,7 @@ class DatabaseManager:
                    p_over_model, stdev, odds, over_odds, under_odds, over_provider, under_provider,
                    actual_result, won
             FROM picks
-            WHERE actual_result IS NULL AND won IS NULL AND timestamp < ?
+            WHERE won IS NULL AND timestamp < ?
             ORDER BY id
             """,
             (before_str,),
@@ -238,7 +243,7 @@ class DatabaseManager:
 
     def update_pick_result(self, pick_id: int, actual_result: float, won: int) -> None:
         """
-        Set actual_result and won for a pick (won: 1 = win, 0 = loss).
+        Set actual_result and won for a pick (won: 1 = win, 0 = loss, -1 = push/void).
         actual_result is the actual stat value (PTS/REB/AST) from the game.
         """
         assert self._conn is not None

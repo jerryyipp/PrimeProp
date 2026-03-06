@@ -9,13 +9,14 @@ Main.py contract:
   - get_stat_series(games: list[dict], stat_type: str) -> list[float]   # Points, Rebounds, Assists
 """
 
-__all__ = ["resolve_nba_player_id", "fetch_last_n_games", "get_stat_series", "get_rest_days", "fetch_season_to_date_avg"]
+__all__ = ["resolve_nba_player_id", "fetch_last_n_games", "get_stat_series", "get_stat_and_minutes_series", "get_rest_days", "fetch_season_to_date_avg"]
 
 import asyncio
 import json
+import threading
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 from nba_api.stats.endpoints import playercareerstats, playergamelog
 from nba_api.stats.static import players
@@ -28,6 +29,10 @@ NBA_ID_CACHE_PATH = _CACHE_DIR / "nba_player_id_cache.json"
 GAME_RESULT_CACHE_PATH = _CACHE_DIR / "game_result_cache.json"
 CACHE_TTL = timedelta(hours=24)
 GAME_RESULT_CACHE_TTL = timedelta(days=7)
+
+# Locks to prevent read-modify-write races. threading.Lock used so sync cache layer is safe when called from async.
+_cache_lock = threading.Lock()
+_nba_id_lock = threading.Lock()
 
 # In-memory cache for canonical_name -> nba_player_id (persisted to disk on resolve)
 _nba_id_memory_cache: Dict[str, int] = {}
@@ -80,24 +85,29 @@ def resolve_nba_player_id(canonical_name: str) -> Optional[int]:
     """
     Resolve canonical_name -> nba_player_id. Uses in-memory then disk cache (nba_player_id_cache.json),
     then nba_api find_players_by_full_name. Returns None if resolution fails (caller should skip).
+    Thread-safe: lock only wraps cache read/write; network call is done outside the lock.
     """
     if not canonical_name or not canonical_name.strip():
         return None
     canonical_name = canonical_name.strip()
 
-    global _nba_id_memory_cache
-    if not _nba_id_memory_cache:
-        _nba_id_memory_cache = _load_nba_id_cache()
-
-    if canonical_name in _nba_id_memory_cache:
-        return _nba_id_memory_cache[canonical_name]
+    with _nba_id_lock:
+        global _nba_id_memory_cache
+        if not _nba_id_memory_cache:
+            _nba_id_memory_cache = _load_nba_id_cache()
+        if canonical_name in _nba_id_memory_cache:
+            return _nba_id_memory_cache[canonical_name]
 
     nba_players = players.find_players_by_full_name(canonical_name)
     if not nba_players:
         return None
     nba_id = int(nba_players[0]["id"])
-    _nba_id_memory_cache[canonical_name] = nba_id
-    _save_nba_id_cache(_nba_id_memory_cache)
+
+    with _nba_id_lock:
+        if not _nba_id_memory_cache:
+            _nba_id_memory_cache = _load_nba_id_cache()
+        _nba_id_memory_cache[canonical_name] = nba_id
+        _save_nba_id_cache(_nba_id_memory_cache)
     return nba_id
 
 
@@ -128,31 +138,33 @@ def _current_nba_season_id() -> str:
 
 def _get_cached_gamelog(nba_player_id: int, n: int) -> Optional[List[Dict]]:
     """Return cached gamelog rows if present and not expired."""
-    cache = _load_cache()
-    key = _gamelog_cache_key(nba_player_id, n)
-    entry = cache.get(key)
-    if not entry:
-        return None
-    try:
-        ts = datetime.fromisoformat(entry["cached_at"])
-    except Exception:
-        return None
-    if datetime.now(timezone.utc) - ts > CACHE_TTL:
-        return None
-    rows = entry.get("games")
-    if not isinstance(rows, list):
-        return None
-    return rows
+    with _cache_lock:
+        cache = _load_cache()
+        key = _gamelog_cache_key(nba_player_id, n)
+        entry = cache.get(key)
+        if not entry:
+            return None
+        try:
+            ts = datetime.fromisoformat(entry["cached_at"])
+        except Exception:
+            return None
+        if datetime.now(timezone.utc) - ts > CACHE_TTL:
+            return None
+        rows = entry.get("games")
+        if not isinstance(rows, list):
+            return None
+        return rows
 
 
 def _set_cached_gamelog(nba_player_id: int, n: int, games: List[Dict]) -> None:
-    cache = _load_cache()
-    key = _gamelog_cache_key(nba_player_id, n)
-    cache[key] = {
-        "cached_at": datetime.now(timezone.utc).isoformat(),
-        "games": games,
-    }
-    _save_cache(cache)
+    with _cache_lock:
+        cache = _load_cache()
+        key = _gamelog_cache_key(nba_player_id, n)
+        cache[key] = {
+            "cached_at": datetime.now(timezone.utc).isoformat(),
+            "games": games,
+        }
+        _save_cache(cache)
 
 
 def _parse_minutes(min_val: Any) -> Optional[float]:
@@ -216,8 +228,8 @@ def _fetch_gamelog_sync(nba_player_id: int, n: int) -> List[Dict]:
 
 async def fetch_last_n_games(nba_player_id: int, n: int) -> List[Dict]:
     """
-    Fetch last n games for a player; each row has GAME_DATE, PTS, REB, AST, FG3M.
-    Uses existing cache folder + TTL. Prefer this over per-stat fetches when building multiple series.
+    Fetch last n games for a player; each row has GAME_DATE, PTS, REB, AST, MIN (float minutes).
+    Uses existing cache folder + TTL. Cache read/write is serialized by _cache_lock in sync layer.
     """
     cached = _get_cached_gamelog(nba_player_id, n)
     if cached is not None:
@@ -231,31 +243,33 @@ async def fetch_last_n_games(nba_player_id: int, n: int) -> List[Dict]:
 
 def _get_cached_season_avg(nba_player_id: int, stat_type: str, season_id: str) -> Optional[float]:
     """Return cached season average if present and not expired."""
-    cache = _load_cache()
-    key = _season_avg_cache_key(nba_player_id, stat_type, season_id)
-    entry = cache.get(key)
-    if not entry:
-        return None
-    try:
-        ts = datetime.fromisoformat(entry["cached_at"])
-    except Exception:
-        return None
-    if datetime.now(timezone.utc) - ts > CACHE_TTL:
-        return None
-    val = entry.get("value")
-    if val is None:
-        return None
-    try:
-        return float(val)
-    except (TypeError, ValueError):
-        return None
+    with _cache_lock:
+        cache = _load_cache()
+        key = _season_avg_cache_key(nba_player_id, stat_type, season_id)
+        entry = cache.get(key)
+        if not entry:
+            return None
+        try:
+            ts = datetime.fromisoformat(entry["cached_at"])
+        except Exception:
+            return None
+        if datetime.now(timezone.utc) - ts > CACHE_TTL:
+            return None
+        val = entry.get("value")
+        if val is None:
+            return None
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return None
 
 
 def _set_cached_season_avg(nba_player_id: int, stat_type: str, season_id: str, value: float) -> None:
-    cache = _load_cache()
-    key = _season_avg_cache_key(nba_player_id, stat_type, season_id)
-    cache[key] = {"cached_at": datetime.now(timezone.utc).isoformat(), "value": value}
-    _save_cache(cache)
+    with _cache_lock:
+        cache = _load_cache()
+        key = _season_avg_cache_key(nba_player_id, stat_type, season_id)
+        cache[key] = {"cached_at": datetime.now(timezone.utc).isoformat(), "value": value}
+        _save_cache(cache)
 
 
 def _fetch_season_to_date_avg_sync(nba_player_id: int, stat_type: str) -> Optional[float]:
@@ -288,7 +302,7 @@ def _fetch_season_to_date_avg_sync(nba_player_id: int, stat_type: str) -> Option
 
 async def fetch_season_to_date_avg(nba_player_id: int, stat_type: str) -> Optional[float]:
     """
-    Return season-to-date per-game average for PTS/REB/AST. Uses same cache (stats_cache.json) and TTL as gamelog.
+    Return season-to-date per-game average for PTS/REB/AST. Cache read/write serialized by _cache_lock.
     """
     season_id = _current_nba_season_id()
     cached = _get_cached_season_avg(nba_player_id, stat_type, season_id)
@@ -342,46 +356,79 @@ def get_stat_series(games: List[Dict], stat_type: str) -> List[float]:
     """
     Extract a stat series from gamelog rows. Supports only Points, Rebounds, Assists.
     stat_type: 'Points'|'Rebounds'|'Assists' or lowercase/aliases (points, rebounds, assists, pts, reb, ast).
-    Returns list of floats (oldest to newest).
+    Returns list of floats (oldest to newest). Only includes games that have the stat (and MIN for alignment).
     """
     if not games:
         return []
     st = (stat_type or "").strip().lower()
     if st in ("points", "pts"):
-        return [float(g["PTS"]) for g in games if "PTS" in g]
+        return [float(g["PTS"]) for g in games if "PTS" in g and "MIN" in g]
     if st in ("rebounds", "reb"):
-        return [float(g["REB"]) for g in games if "REB" in g]
+        return [float(g["REB"]) for g in games if "REB" in g and "MIN" in g]
     if st in ("assists", "ast"):
-        return [float(g["AST"]) for g in games if "AST" in g]
+        return [float(g["AST"]) for g in games if "AST" in g and "MIN" in g]
     return []
 
 
+def get_stat_and_minutes_series(
+    games: List[Dict], stat_type: str
+) -> Tuple[List[float], List[float]]:
+    """
+    Extract aligned (values, minutes) from gamelog rows. Only includes games that have both the stat and MIN.
+    Returns (stat_values, minutes) so projections can use stat_total = minutes * per_minute_rate.
+    """
+    if not games:
+        return ([], [])
+    st = (stat_type or "").strip().lower()
+    values: List[float] = []
+    minutes: List[float] = []
+    for g in games:
+        if "MIN" not in g:
+            continue
+        try:
+            min_val = float(g["MIN"])
+        except (TypeError, ValueError):
+            continue
+        if st in ("points", "pts") and "PTS" in g:
+            values.append(float(g["PTS"]))
+            minutes.append(min_val)
+        elif st in ("rebounds", "reb") and "REB" in g:
+            values.append(float(g["REB"]))
+            minutes.append(min_val)
+        elif st in ("assists", "ast") and "AST" in g:
+            values.append(float(g["AST"]))
+            minutes.append(min_val)
+    return (values, minutes)
+
+
 def _get_cached_values(player_name: str, stat_type: StatType, n_games: int) -> Optional[List[float]]:
-    cache = _load_cache()
-    key = _cache_key(player_name, stat_type, n_games)
-    entry = cache.get(key)
-    if not entry:
-        return None
-    try:
-        ts = datetime.fromisoformat(entry["cached_at"])
-    except Exception:
-        return None
-    if datetime.now(timezone.utc) - ts > CACHE_TTL:
-        return None
-    values = entry.get("values")
-    if not isinstance(values, list):
-        return None
-    return [float(v) for v in values]
+    with _cache_lock:
+        cache = _load_cache()
+        key = _cache_key(player_name, stat_type, n_games)
+        entry = cache.get(key)
+        if not entry:
+            return None
+        try:
+            ts = datetime.fromisoformat(entry["cached_at"])
+        except Exception:
+            return None
+        if datetime.now(timezone.utc) - ts > CACHE_TTL:
+            return None
+        values = entry.get("values")
+        if not isinstance(values, list):
+            return None
+        return [float(v) for v in values]
 
 
 def _set_cached_values(player_name: str, stat_type: StatType, n_games: int, values: List[float]) -> None:
-    cache = _load_cache()
-    key = _cache_key(player_name, stat_type, n_games)
-    cache[key] = {
-        "cached_at": datetime.now(timezone.utc).isoformat(),
-        "values": values,
-    }
-    _save_cache(cache)
+    with _cache_lock:
+        cache = _load_cache()
+        key = _cache_key(player_name, stat_type, n_games)
+        cache[key] = {
+            "cached_at": datetime.now(timezone.utc).isoformat(),
+            "values": values,
+        }
+        _save_cache(cache)
 
 
 def _fetch_from_nba_api_sync(
@@ -503,7 +550,7 @@ def fetch_game_result(
 ) -> Optional[float]:
     """
     Fetch actual PTS/REB/AST (or PRA/Threes) for a player on a game date using nba_api PlayerGameLog.
-    If no exact date match, returns the value from the closest matching game (by date).
+    If no exact date match, returns the value from the closest matching game within 1 day and prints a warning.
     Returns None if no game found. Results are cached (7-day TTL).
     """
     if isinstance(game_date, datetime):
@@ -553,14 +600,20 @@ def fetch_game_result(
             _set_cached_game_result(player_nba_id, game_date, stat_type, val)
             return val
 
-    # Closest matching game by date distance (within 7 days)
+    # Closest matching game by date distance (within 1 day)
     def days_diff(d: date) -> int:
         return abs((d - game_date).days)
 
     best = min(candidates, key=lambda x: days_diff(x[0]))
-    if days_diff(best[0]) > 7:
+    if days_diff(best[0]) > 1:
         return None
     val = best[1]
+    actual_date = best[0]
+    print(
+        "Warning: no exact game date for player_nba_id={}, expected_date={}; using closest match date={}".format(
+            player_nba_id, game_date, actual_date
+        )
+    )
     _set_cached_game_result(player_nba_id, game_date, stat_type, val)
     return val
 
