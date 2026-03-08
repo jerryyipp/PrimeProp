@@ -149,10 +149,9 @@ async def main() -> None:
     ranked = filtered_ranked
     print(f"High-variance filter: excluded_high_variance={excluded_high_variance}, included_high_variance_due_to_ev={included_high_variance_due_to_ev}")
 
-    # Top N (EV ranking): mean±stdev, EV, book/odds, confidence label
-    top_n = 10
-    print(f"\n--- Top {top_n} props by edge/EV ---")
-    for i, edge in enumerate(ranked[:top_n], 1):
+    # Best available picks (all ranked): mean±stdev, EV, book/odds, confidence label
+    print(f"\n--- Best available picks by edge/EV ({len(ranked)} ranked) ---")
+    for i, edge in enumerate(ranked, 1):
         name = id_to_canonical.get(edge.player_id, edge.player_id)
         mean_s = f"{edge.projected:.1f}"
         if edge.projected_stdev is not None:
@@ -164,12 +163,11 @@ async def main() -> None:
         confidence_s = res.confidence if (res and getattr(res, "confidence", None)) else "—"
         print(f"  {i}. {name} {edge.stat_type} {edge.market_line} | {mean_s}{ev_s} -> {edge.recommended_side}{odds_s}{book_s} | {confidence_s}")
 
-    alert_top_n = _env_int("ALERT_TOP_N", 25)
-    top_alerts = ranked[:alert_top_n]
+    # Alert and save all picks that meet quality threshold (no fixed cap)
     high_value_alerts = alert_high_value_props(
-        top_alerts, min_edge=0.05, min_ev=0.05, player_names=id_to_canonical
+        ranked, min_edge=0.05, min_ev=0.05, player_names=id_to_canonical
     )
-    print("Alerts sent for {} picks (Top {})".format(len(high_value_alerts), alert_top_n))
+    print("Alerts sent for {} picks (best available above threshold).".format(len(high_value_alerts)))
 
     def _above_alert_threshold(edge: Any) -> bool:
         if getattr(edge, "best_ev", None) is not None:
