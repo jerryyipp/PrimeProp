@@ -111,6 +111,13 @@ async def main() -> None:
     ranked, id_to_canonical, resolved_nba_ids, projected = await run_ranking_for_snapshot(
         snapshot, players_by_id, ingest_counters=ingest_counters, open_lines=open_lines
     )
+    print("Ranked props generated (from optimizer): {}".format(len(ranked)))
+
+    # Only bettable picks: exclude Pass (no actionable side)
+    n_before_pass = len(ranked)
+    ranked = [e for e in ranked if e.recommended_side != "Pass"]
+    if n_before_pass > len(ranked):
+        print(f"Excluded {n_before_pass - len(ranked)} Pass props (bettable only: Over/Under).")
 
     if os.getenv("REQUIRE_LINE_MOVEMENT_WITH_US", "0").strip().lower() in ("1", "true", "yes"):
         delta_default = 0.0
@@ -149,9 +156,14 @@ async def main() -> None:
     ranked = filtered_ranked
     print(f"High-variance filter: excluded_high_variance={excluded_high_variance}, included_high_variance_due_to_ev={included_high_variance_due_to_ev}")
 
+    # Snapshot the exact list we will print and save (ranked is final after all filters; copy so display/save cannot diverge)
+    final_displayed_picks = list(ranked)
+    n_displayed = len(final_displayed_picks)
+    print("Final best available picks (to display and save): {}".format(n_displayed))
+
     # Best available picks (all ranked): mean±stdev, EV, book/odds, confidence label
-    print(f"\n--- Best available picks by edge/EV ({len(ranked)} ranked) ---")
-    for i, edge in enumerate(ranked, 1):
+    print(f"\n--- Best available picks by edge/EV ({n_displayed} ranked) ---")
+    for i, edge in enumerate(final_displayed_picks, 1):
         name = id_to_canonical.get(edge.player_id, edge.player_id)
         mean_s = f"{edge.projected:.1f}"
         if edge.projected_stdev is not None:
@@ -163,23 +175,17 @@ async def main() -> None:
         confidence_s = res.confidence if (res and getattr(res, "confidence", None)) else "—"
         print(f"  {i}. {name} {edge.stat_type} {edge.market_line} | {mean_s}{ev_s} -> {edge.recommended_side}{odds_s}{book_s} | {confidence_s}")
 
-    # Alert and save all picks that meet quality threshold (no fixed cap)
+    # Alerts: only from final displayed list (still filtered by min_ev/min_edge inside alert_high_value_props)
     high_value_alerts = alert_high_value_props(
-        ranked, min_edge=0.05, min_ev=0.05, player_names=id_to_canonical
+        final_displayed_picks, min_edge=0.05, min_ev=0.05, player_names=id_to_canonical
     )
-    print("Alerts sent for {} picks (best available above threshold).".format(len(high_value_alerts)))
+    print("Alerts sent for {} picks (from displayed, above threshold).".format(len(high_value_alerts)))
 
-    def _above_alert_threshold(edge: Any) -> bool:
-        if getattr(edge, "best_ev", None) is not None:
-            return edge.best_ev >= 0.05
-        return abs(getattr(edge, "edge", 0) or 0) >= 0.05
-
-    save_all = _env_bool("SAVE_ALL", False)
-    to_save = [e for e in ranked if _above_alert_threshold(e)] if save_all else high_value_alerts
-    if to_save:
+    # Save to DB: exactly the final displayed picks (no extra threshold; display = save)
+    if final_displayed_picks:
         db = DatabaseManager()
         try:
-            for edge in to_save:
+            for edge in final_displayed_picks:
                 db.log_pick(
                     player_name=id_to_canonical.get(edge.player_id, edge.player_id),
                     stat_type=edge.stat_type,
@@ -198,9 +204,11 @@ async def main() -> None:
                     nba_player_id=resolved_nba_ids.get(edge.player_id),
                     game_start=None,
                 )
-            print("Saved {} picks to the database.".format(len(to_save)))
+            print("Saved {} picks to the database (same as displayed).".format(len(final_displayed_picks)))
         finally:
             db.close()
+    else:
+        print("No picks to save (final displayed list is empty).")
 
 
 if __name__ == "__main__":
