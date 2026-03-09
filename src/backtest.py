@@ -17,13 +17,14 @@ if _root not in sys.path:
     sys.path.insert(0, str(_root))
 
 from src.database import DatabaseManager
-from src.optimizer import (
-    profit_per_unit,
-    fit_calibration_from_picks,
-    save_calibration,
-    DEFAULT_CALIBRATION_PATH,
-    _clamp_calibrated,
-)
+# TEMP DISABLED: requires p_over_model (uncomment when re-enabling Brier/log loss/calibration/EV sections)
+# from src.optimizer import (
+#     profit_per_unit,
+#     fit_calibration_from_picks,
+#     save_calibration,
+#     DEFAULT_CALIBRATION_PATH,
+#     _clamp_calibrated,
+# )
 
 
 # Bins for model probability (Over): (low, high) in [0, 1]
@@ -81,74 +82,75 @@ def run_backtest(db_path: Optional[Path] = None) -> None:
     print("--- Backtest (graded picks only, pushes excluded) ---")
     print(f"Overall: n={n}, wins={wins}, hit rate={hit_rate_pct}%")
 
-    # Brier score and log loss (picks with p_win; exclude pushes)
-    p_win_outcomes: list[tuple[float, int]] = []
-    for r in settled:
-        p_win = _p_win_for_pick(r)
-        if p_win is None:
-            continue
-        if r["won"] == -1:
-            continue
-        outcome = 1 if r["won"] == 1 else 0
-        p_win_outcomes.append((p_win, outcome))
-    if p_win_outcomes:
-        n_prob = len(p_win_outcomes)
-        brier = sum((p - y) ** 2 for p, y in p_win_outcomes) / n_prob
-        eps = 1e-15
-        log_loss = -sum(
-            y * math.log(max(p, eps)) + (1 - y) * math.log(max(1 - p, eps))
-            for p, y in p_win_outcomes
-        ) / n_prob
-        print("\nBrier score (lower better): {:.4f}".format(brier))
-        print("Log loss (lower better): {:.4f}".format(log_loss))
-
-    # Calibration bin report: avg predicted vs actual hit rate
-    print("\nCalibration bins (avg predicted vs actual hit rate):")
-    for low, high in P_OVER_BINS:
-        in_bin = []
-        for r in settled:
-            p_win = _p_win_for_pick(r)
-            if p_win is None:
-                continue
-            if r["won"] == -1:
-                continue
-            if low <= p_win < high:
-                in_bin.append(r)
-        if not in_bin:
-            print(f"  {low:.2f}-{high:.2f}: (no picks)")
-            continue
-        avg_pred = sum(_p_win_for_pick(r) for r in in_bin) / len(in_bin)
-        b_wins = sum(1 for r in in_bin if r["won"] == 1)
-        actual_hr = b_wins / len(in_bin)
-        print(f"  {low:.2f}-{high:.2f}: n={len(in_bin)}, avg_predicted={avg_pred:.3f}, actual_hit_rate={actual_hr:.3f}")
-
-    # Expected EV (model) vs realized profit (actual), per $1 stake
-    total_ev = 0.0
-    total_realized = 0.0
-    used = 0
-    for r in settled:
-        if r["won"] == -1:
-            continue
-        p_win = _p_win_for_pick(r)
-        try:
-            odds = r["odds"] if "odds" in r.keys() else None
-        except (KeyError, TypeError):
-            odds = None
-        if p_win is None or odds is None:
-            continue
-        profit = profit_per_unit(odds)
-        if profit is None:
-            continue
-        total_ev += p_win * profit - (1.0 - p_win) * 1.0
-        won = 1 if r["won"] == 1 else 0
-        total_realized += won * profit - (1 - won) * 1.0
-        used += 1
-
-    print("\nExpected EV (model) vs realized profit (actual), per $1 stake (pushes excluded):")
-    print(f"  Picks used: {used} / {n}")
-    print(f"  Sum expected EV:   {total_ev:.4f}")
-    print(f"  Sum realized:      {total_realized:.4f}")
-    print(f"  Difference (EV − realized): {total_ev - total_realized:.4f}")
+    # TEMP DISABLED: requires p_over_model (uncomment when all rows have p_over_model)
+    # # Brier score and log loss (picks with p_win; exclude pushes)
+    # p_win_outcomes: list[tuple[float, int]] = []
+    # for r in settled:
+    #     p_win = _p_win_for_pick(r)
+    #     if p_win is None:
+    #         continue
+    #     if r["won"] == -1:
+    #         continue
+    #     outcome = 1 if r["won"] == 1 else 0
+    #     p_win_outcomes.append((p_win, outcome))
+    # if p_win_outcomes:
+    #     n_prob = len(p_win_outcomes)
+    #     brier = sum((p - y) ** 2 for p, y in p_win_outcomes) / n_prob
+    #     eps = 1e-15
+    #     log_loss = -sum(
+    #         y * math.log(max(p, eps)) + (1 - y) * math.log(max(1 - p, eps))
+    #         for p, y in p_win_outcomes
+    #     ) / n_prob
+    #     print("\nBrier score (lower better): {:.4f}".format(brier))
+    #     print("Log loss (lower better): {:.4f}".format(log_loss))
+    #
+    # # Calibration bin report: avg predicted vs actual hit rate
+    # print("\nCalibration bins (avg predicted vs actual hit rate):")
+    # for low, high in P_OVER_BINS:
+    #     in_bin = []
+    #     for r in settled:
+    #         p_win = _p_win_for_pick(r)
+    #         if p_win is None:
+    #             continue
+    #         if r["won"] == -1:
+    #             continue
+    #         if low <= p_win < high:
+    #             in_bin.append(r)
+    #     if not in_bin:
+    #         print(f"  {low:.2f}-{high:.2f}: (no picks)")
+    #         continue
+    #     avg_pred = sum(_p_win_for_pick(r) for r in in_bin) / len(in_bin)
+    #     b_wins = sum(1 for r in in_bin if r["won"] == 1)
+    #     actual_hr = b_wins / len(in_bin)
+    #     print(f"  {low:.2f}-{high:.2f}: n={len(in_bin)}, avg_predicted={avg_pred:.3f}, actual_hit_rate={actual_hr:.3f}")
+    #
+    # # Expected EV (model) vs realized profit (actual), per $1 stake
+    # total_ev = 0.0
+    # total_realized = 0.0
+    # used = 0
+    # for r in settled:
+    #     if r["won"] == -1:
+    #         continue
+    #     p_win = _p_win_for_pick(r)
+    #     try:
+    #         odds = r["odds"] if "odds" in r.keys() else None
+    #     except (KeyError, TypeError):
+    #         odds = None
+    #     if p_win is None or odds is None:
+    #         continue
+    #     profit = profit_per_unit(odds)
+    #     if profit is None:
+    #         continue
+    #     total_ev += p_win * profit - (1.0 - p_win) * 1.0
+    #     won = 1 if r["won"] == 1 else 0
+    #     total_realized += won * profit - (1 - won) * 1.0
+    #     used += 1
+    #
+    # print("\nExpected EV (model) vs realized profit (actual), per $1 stake (pushes excluded):")
+    # print(f"  Picks used: {used} / {n}")
+    # print(f"  Sum expected EV:   {total_ev:.4f}")
+    # print(f"  Sum realized:      {total_realized:.4f}")
+    # print(f"  Difference (EV − realized): {total_ev - total_realized:.4f}")
 
 
 def _brier_and_logloss(p_win_outcomes: list[tuple[float, int]]) -> tuple[float, float]:
@@ -166,32 +168,33 @@ def _brier_and_logloss(p_win_outcomes: list[tuple[float, int]]) -> tuple[float, 
 
 
 if __name__ == "__main__":
-    if "--fit-calibration" in sys.argv:
-        db = DatabaseManager()
-        rows = db.get_graded_picks()
-        db.close()
-        if len(rows) < 10:
-            print("Need at least 10 graded picks to fit calibration. Run backtest without --fit-calibration first.")
-        else:
-            # Build (p_win, outcome) for each pick (exclude pushes)
-            p_win_outcomes: list[tuple[float, int]] = []
-            for r in rows:
-                if r["won"] == -1:
-                    continue
-                p_win = _p_win_for_pick(r)
-                if p_win is None:
-                    continue
-                outcome = 1 if r["won"] == 1 else 0
-                p_win_outcomes.append((float(p_win), outcome))
-            brier_before, logloss_before = _brier_and_logloss(p_win_outcomes)
-            print("Before calibration: Brier = {:.4f}, Log loss = {:.4f}".format(brier_before, logloss_before))
-
-            a, b = fit_calibration_from_picks(rows)
-            save_calibration(DEFAULT_CALIBRATION_PATH, a, b)
-            print(f"Fitted calibration a={a:.4f}, b={b:.4f} -> saved to {DEFAULT_CALIBRATION_PATH}")
-
-            # After: p' = clamp(a*p + b, 0, 1)
-            p_cal_outcomes = [(_clamp_calibrated(p, a, b), y) for p, y in p_win_outcomes]
-            brier_after, logloss_after = _brier_and_logloss(p_cal_outcomes)
-            print("After calibration:  Brier = {:.4f}, Log loss = {:.4f}".format(brier_after, logloss_after))
+    # TEMP DISABLED: requires p_over_model (uncomment when re-enabling advanced sections)
+    # if "--fit-calibration" in sys.argv:
+    #     db = DatabaseManager()
+    #     rows = db.get_graded_picks()
+    #     db.close()
+    #     if len(rows) < 10:
+    #         print("Need at least 10 graded picks to fit calibration. Run backtest without --fit-calibration first.")
+    #     else:
+    #         # Build (p_win, outcome) for each pick (exclude pushes)
+    #         p_win_outcomes: list[tuple[float, int]] = []
+    #         for r in rows:
+    #             if r["won"] == -1:
+    #                 continue
+    #             p_win = _p_win_for_pick(r)
+    #             if p_win is None:
+    #                 continue
+    #             outcome = 1 if r["won"] == 1 else 0
+    #             p_win_outcomes.append((float(p_win), outcome))
+    #         brier_before, logloss_before = _brier_and_logloss(p_win_outcomes)
+    #         print("Before calibration: Brier = {:.4f}, Log loss = {:.4f}".format(brier_before, logloss_before))
+    #
+    #         a, b = fit_calibration_from_picks(rows)
+    #         save_calibration(DEFAULT_CALIBRATION_PATH, a, b)
+    #         print(f"Fitted calibration a={a:.4f}, b={b:.4f} -> saved to {DEFAULT_CALIBRATION_PATH}")
+    #
+    #         # After: p' = clamp(a*p + b, 0, 1)
+    #         p_cal_outcomes = [(_clamp_calibrated(p, a, b), y) for p, y in p_win_outcomes]
+    #         brier_after, logloss_after = _brier_and_logloss(p_cal_outcomes)
+    #         print("After calibration:  Brier = {:.4f}, Log loss = {:.4f}".format(brier_after, logloss_after))
     run_backtest()
