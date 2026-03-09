@@ -529,6 +529,17 @@ def _set_cached_game_result(
     _save_game_result_cache(cache)
 
 
+def delete_cached_game_result(
+    player_nba_id: int, game_date: date, stat_type: StatType
+) -> None:
+    """Remove one game-result cache entry (e.g. to fix bad data from closest-date fallback)."""
+    cache = _load_game_result_cache()
+    key = _game_result_cache_key(player_nba_id, game_date, stat_type)
+    if key in cache:
+        del cache[key]
+        _save_game_result_cache(cache)
+
+
 def _parse_game_date(date_str: str) -> Optional[date]:
     """Parse nba_api GAME_DATE ('OCT 26, 2023' or '2024-10-22') to date."""
     if not date_str:
@@ -547,34 +558,44 @@ def fetch_game_result(
     player_nba_id: int,
     game_date: Union[date, datetime],
     stat_type: StatType,
-) -> Optional[float]:
+) -> Tuple[str, Optional[float]]:
     """
     Fetch actual PTS/REB/AST (or PRA/Threes) for a player on a game date using nba_api PlayerGameLog.
-    If no exact date match, returns the value from the closest matching game within 1 day and prints a warning.
-    Returns None if no game found. Results are cached (7-day TTL).
+    Uses exact game-date match only; no closest-date fallback (grading must not use wrong game).
+    Returns:
+        ("ok", value) if exact date match and player played (MIN > 0); value is cached.
+        ("dnp", None) if exact date match but player did not play (MIN 0 or missing) -> grader should void.
+        ("no_match", None) if no game on expected date -> grader should skip.
+    Only exact-date results are cached; never cache a different date under the expected key.
     """
     if isinstance(game_date, datetime):
         game_date = game_date.date()
 
     cached = _get_cached_game_result(player_nba_id, game_date, stat_type)
     if cached is not None:
-        return cached
+        return ("ok", cached)
 
     try:
         log = playergamelog.PlayerGameLog(player_id=player_nba_id)
         df = log.get_data_frames()[0]
     except Exception:
-        return None
+        return ("no_match", None)
     if df is None or df.empty:
-        return None
+        return ("no_match", None)
 
-    # Build list of (parsed_date, stat_value); find exact or closest match
-    candidates: List[tuple[date, float]] = []
     for _, row in df.iterrows():
         try:
             parsed = _parse_game_date(row.get("GAME_DATE"))
-            if parsed is None:
+            if parsed is None or parsed != game_date:
                 continue
+            min_played = row.get("MIN")
+            if min_played is not None:
+                try:
+                    min_f = float(min_played)
+                    if min_f <= 0:
+                        return ("dnp", None)
+                except (TypeError, ValueError):
+                    return ("dnp", None)
             if stat_type == "Points":
                 val = float(row["PTS"])
             elif stat_type == "Rebounds":
@@ -586,36 +607,13 @@ def fetch_game_result(
             elif stat_type == "Threes":
                 val = float(row["FG3M"])
             else:
-                continue
-            candidates.append((parsed, val))
+                return ("no_match", None)
+            _set_cached_game_result(player_nba_id, game_date, stat_type, val)
+            return ("ok", val)
         except (ValueError, KeyError, TypeError):
             continue
 
-    if not candidates:
-        return None
-
-    # Exact match first
-    for d, val in candidates:
-        if d == game_date:
-            _set_cached_game_result(player_nba_id, game_date, stat_type, val)
-            return val
-
-    # Closest matching game by date distance (within 1 day)
-    def days_diff(d: date) -> int:
-        return abs((d - game_date).days)
-
-    best = min(candidates, key=lambda x: days_diff(x[0]))
-    if days_diff(best[0]) > 1:
-        return None
-    val = best[1]
-    actual_date = best[0]
-    print(
-        "Warning: no exact game date for player_nba_id={}, expected_date={}; using closest match date={}".format(
-            player_nba_id, game_date, actual_date
-        )
-    )
-    _set_cached_game_result(player_nba_id, game_date, stat_type, val)
-    return val
+    return ("no_match", None)
 
 
 async def fetch_last_n_game_values(

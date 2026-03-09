@@ -7,7 +7,8 @@ Ranking logic lives in src.main; this module is a thin entrypoint that loads .en
 import os
 import asyncio
 import aiohttp
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
@@ -28,13 +29,42 @@ from src.injury_filter import (
 )
 from src.main import run_ranking_for_snapshot, _env_int, _env_float, _env_bool
 
+BETTING_DAY_TIMEZONE = "America/Indiana/Indianapolis"
+
+
+def _betting_day_date(dt_utc: datetime, tz_name: str, rollover_hour: int) -> date:
+    """
+    Return the betting-day date for a timezone-aware UTC datetime.
+    Betting day rolls over at rollover_hour (0-23) local time in tz_name.
+    If local time is before rollover_hour, the betting day is the previous calendar day.
+    """
+    tz = ZoneInfo(tz_name)
+    local = dt_utc.astimezone(tz)
+    if local.hour < rollover_hour:
+        return local.date() - timedelta(days=1)
+    return local.date()
+
 
 async def get_upcoming_event_ids(api_key: str) -> list[str]:
-    """Fetches games and returns IDs only for games in today's betting day that have NOT started yet."""
+    """Fetches games and returns IDs only for games in the current betting day that have NOT started yet."""
+    rollover_hour = max(0, min(23, _env_int("BETTING_DAY_ROLLOVER_HOUR", 1)))
+    tz = ZoneInfo(BETTING_DAY_TIMEZONE)
+
     url = "https://api.the-odds-api.com/v4/sports/basketball_nba/events"
     upcoming_ids = []
     now = datetime.now(timezone.utc)
-    current_betting_date = (now - timedelta(hours=6)).date()
+    local_now = now.astimezone(tz)
+    current_betting_date = _betting_day_date(now, BETTING_DAY_TIMEZONE, rollover_hour)
+
+    print(
+        "Betting day: tz={}, rollover_hour={}, now_utc={}, now_local={}, current_betting_date={}".format(
+            BETTING_DAY_TIMEZONE,
+            rollover_hour,
+            now.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            local_now.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            current_betting_date,
+        )
+    )
 
     async with aiohttp.ClientSession() as session:
         async with session.get(url, params={"apiKey": api_key}) as resp:
@@ -42,7 +72,9 @@ async def get_upcoming_event_ids(api_key: str) -> list[str]:
             for game in games:
                 commence_str = game["commence_time"].replace("Z", "+00:00")
                 commence_time = datetime.fromisoformat(commence_str)
-                game_betting_date = (commence_time - timedelta(hours=6)).date()
+                if commence_time.tzinfo is None:
+                    commence_time = commence_time.replace(tzinfo=timezone.utc)
+                game_betting_date = _betting_day_date(commence_time, BETTING_DAY_TIMEZONE, rollover_hour)
                 if game_betting_date == current_betting_date and commence_time > now:
                     upcoming_ids.append(game["id"])
     return upcoming_ids

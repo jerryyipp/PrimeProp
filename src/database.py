@@ -241,15 +241,26 @@ class DatabaseManager:
         )
         return cur.fetchall()
 
-    def update_pick_result(self, pick_id: int, actual_result: float, won: int) -> None:
+    def update_pick_result(
+        self, pick_id: int, actual_result: Optional[float], won: int
+    ) -> None:
         """
         Set actual_result and won for a pick (won: 1 = win, 0 = loss, -1 = push/void).
-        actual_result is the actual stat value (PTS/REB/AST) from the game.
+        actual_result is the stat value from the game; use None for void/DNP.
         """
         assert self._conn is not None
         self._conn.execute(
             "UPDATE picks SET actual_result = ?, won = ? WHERE id = ?",
             (actual_result, won, pick_id),
+        )
+        self._conn.commit()
+
+    def reset_pick_to_ungraded(self, pick_id: int) -> None:
+        """Set actual_result and won to NULL so the pick can be regraded (e.g. after fixing grading logic)."""
+        assert self._conn is not None
+        self._conn.execute(
+            "UPDATE picks SET actual_result = NULL, won = NULL WHERE id = ?",
+            (pick_id,),
         )
         self._conn.commit()
 

@@ -109,20 +109,38 @@ def grade_picks(
             skipped += 1
             continue
 
+        status: str = "no_match"
         actual: Optional[float] = None
         for attempt in range(MAX_RETRIES):
-            actual = fetch_game_result(nba_id, game_date, stat_type)
-            if actual is not None:
+            status, actual = fetch_game_result(nba_id, game_date, stat_type)
+            if status != "no_match" or attempt == MAX_RETRIES - 1:
                 break
             if attempt < MAX_RETRIES - 1:
-                logger.debug("Pick id=%s: fetch_game_result returned None, retry %s/%s", pick_id, attempt + 1, MAX_RETRIES)
+                logger.debug("Pick id=%s: no exact-date match, retry %s/%s", pick_id, attempt + 1, MAX_RETRIES)
                 time.sleep(RETRY_DELAY_SEC)
 
-        if actual is None:
-            logger.warning("Pick id=%s: no game result for %s on %s (%s)", pick_id, player_name, game_date, stat_type)
+        if status == "no_match":
+            logger.warning(
+                "Pick id=%s: no exact game on %s for %s (%s); skipped (do not grade from another date).",
+                pick_id, game_date, player_name, stat_type,
+            )
             skipped += 1
             continue
 
+        if status == "dnp":
+            try:
+                db.update_pick_result(pick_id, None, -1)
+                graded += 1
+                logger.info(
+                    "Pick id=%s: %s %s on %s — ruled out/DNP; marked void (won=-1).",
+                    pick_id, player_name, stat_type, game_date,
+                )
+            except Exception as e:
+                logger.exception("Pick id=%s: update_pick_result (void) failed: %s", pick_id, e)
+                errors += 1
+            continue
+
+        assert status == "ok" and actual is not None
         won = _compute_won(actual, market_line, recommended_side)
         try:
             db.update_pick_result(pick_id, actual, won)
