@@ -23,11 +23,15 @@ CURRENT STATE (AS OF LATEST CODE) — WHAT'S DONE
     - ensemble_projection (weighted combo of methods).
     - Optional matchup adjustment (adjust_for_matchup) for PTS/REB/AST using
       opponent defensive metrics from matchup.py.
+    - apply_context_adjustments: home/away and rest-days context (is_home, rest_days).
+    - Season-to-date blend option (PROJECTION_STRATEGY=season_blend, SEASON_BLEND_ALPHA).
     - Winsorization (optional via WINSORIZE_PCT).
     - Configurable: PROJECTION_N_GAMES, PROJECTION_METHOD, MIN_GAMES_FOR_PROJECTION,
-      PROJECTION_STRATEGY (single/blend/ensemble), ENSEMBLE_WEIGHTS.
+      PROJECTION_STRATEGY (single/blend/ensemble/season_blend), ENSEMBLE_WEIGHTS.
     - Stats from nba_api with 24-hour cache; Points/Rebounds/Assists; PRA/Threes
       via ENABLE_EXTRA_MARKETS.
+    - Per-player game context (multi-game slate): opponent and is_home from each
+      player's PropLine home_team/away_team.
 
   Optimizer (optimizer.py):
     - True EV from Normal(mean, stdev) + American odds; P(Over) via CDF.
@@ -36,28 +40,45 @@ CURRENT STATE (AS OF LATEST CODE) — WHAT'S DONE
     - rank_props_by_edge sorts by best_ev descending; ev_threshold filter.
     - Edge kept for display and fallback when odds missing.
 
-  Database & automation:
-    - grade_picks.py: auto-fetches actual results from NBA.com, updates won.
-    - backtest.py: fits calibration from graded picks, saves to calibration_params.json.
+  Main pipeline (main.py, src/main.py):
+    - Betting-day rollover: timezone-aware (America/Indiana/Indianapolis);
+      BETTING_DAY_ROLLOVER_HOUR (default 1 AM local); no DST drift.
+    - Pass props excluded from displayed/saved list (bettable Over/Under only).
+    - Best available picks: no fixed Top N; display and save the exact same list
+      (final_displayed_picks); alerts from that list above threshold.
+    - Ranking logic in src/main.py; root main.py is thin entrypoint.
+
+  Database & grading:
+    - get_win_rate(): (total_graded, wins, losses, pushes, win_pct); pushes excluded from win_pct.
+    - update_pick_result(pick_id, actual_result, won): actual_result can be None for void/DNP.
+    - reset_pick_to_ungraded(pick_id) for repair/re-grade.
+    - grade_picks.py: exact game-date match only (no closest-date fallback); DNP/ruled-out
+      marked void (won=-1). fetch_game_result returns ("ok"|"dnp"|"no_match", value).
+    - Game-result cache: only exact-date results cached; delete_cached_game_result for repair.
+    - repair_bad_grades.py: one-time fix for picks graded from wrong date (e.g. Giannis);
+      --void, --clear-cache, --pick-id.
+
+  Backtest (backtest.py):
+    - Hit rate (settled picks, pushes excluded) is active.
+    - Brier score, log loss, calibration bins, expected EV vs realized profit, and
+      --fit-calibration are temporarily disabled until p_over_model is populated
+      for all rows (see TEMP DISABLED markers in backtest.py).
 
 --------------------------------------------------------------------------------
 1. RICHER PROJECTIONS (ACCURACY)
 --------------------------------------------------------------------------------
 
-1.1 Home/away and rest context
+1.1 Home/away and rest context — DONE
 
-  - Gap: Projections use only player history; no home/away or rest days.
-  - Add: In main, resolve game context (home_team, away_team from Odds API).
-    For each player, determine if home/away and days since last game.
-  - Use: In projection or a wrapper: home/away multiplier (e.g. +2% home),
-    rest-day adjustment (e.g. -1% on back-to-back). Reduces bias in extreme
-    schedule spots.
+  - Implemented: apply_context_adjustments in projection; main resolves
+    home/away and rest_days per player from PropLine/game context and
+    passes to projection. Reduces bias in back-to-back and home/away spots.
+  - Optional tuning: HOME_BONUS_PCT, B2B_PENALTY_PCT, CONTEXT_ADJUST_CLAMP in .env.
 
-1.2 Season-to-date vs last-N blend
+1.2 Season-to-date vs last-N blend — DONE
 
-  - Gap: All methods use last N games; no explicit season baseline.
-  - Add: Optionally fetch season-to-date average; blend projection = alpha *
-    last_N + (1 - alpha) * season_avg with configurable alpha. Helps when
+  - Implemented: PROJECTION_STRATEGY=season_blend; fetch_season_to_date_avg
+    from stats; blend_lastN_with_season(alpha=SEASON_BLEND_ALPHA). Helps when
     sample is small or noisy (e.g. return from injury).
 
 1.3 Confidence interval in alerts
@@ -91,14 +112,13 @@ CURRENT STATE (AS OF LATEST CODE) — WHAT'S DONE
     to backtest output and any dashboard so users see how often they beat
     the close.
 
-3.2 Line movement tracking
+3.2 Line movement tracking — PARTIALLY DONE
 
-  - Idea: Track the same prop over time (e.g. line was 24.5 morning, now 25).
-  - Add: Persist snapshots (snapshot_id, timestamp, lines) or (player, stat,
-    line, timestamp) in DB or files. A small line movement module: for each
-    prop, compare current line to earliest/previous line.
-  - Use: In UI/alerts: "Line moved from 24.5 to 25 (we like Over)." Later:
-    filter "only show props with line movement in our direction."
+  - Implemented: Open lines from earliest snapshot (get_earliest_snapshot_lines_for_game);
+    run_ranking enriches ranked props with open_line, current_line, delta_line.
+    REQUIRE_LINE_MOVEMENT_WITH_US can filter to props with line movement in
+    our direction. Optional PERSIST_SNAPSHOTS for replay.
+  - Future: Dedicated line movement module and "Line moved from X to Y" in alerts.
 
 --------------------------------------------------------------------------------
 4. INGEST ROBUSTNESS AND QUALITY

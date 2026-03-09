@@ -155,42 +155,67 @@ improved later for accuracy, robustness, and features.
   • DatabaseManager
     - Connects to primeprop.db (creates if not exists). Uses built-in sqlite3.
     - Table picks: id, timestamp, player_name, stat_type, market_line,
-      projected, edge, recommended_side, actual_result (NULL), won (NULL).
+      projected, edge, recommended_side, p_over_model, stdev, odds, over_odds,
+      under_odds, over_provider, under_provider, actual_result (NULL), won (NULL).
+      won: 1=win, 0=loss, -1=push/void (DNP/ruled out).
     - log_pick(...): inserts a pre-game pick with current UTC timestamp.
-    - get_win_rate(): returns (total_graded, wins, losses, pushes, win_pct). Only
-      counts rows where won IS NOT NULL; returns (0,0,0,0.0) when none graded.
-  • main.py persists high-value alerts via log_pick after alerting.
+    - get_win_rate(): returns (total_graded, wins, losses, pushes, win_pct).
+      Pushes excluded from win_pct denominator; only rows where won IS NOT NULL.
+    - update_pick_result(pick_id, actual_result, won): actual_result can be None for void.
+    - reset_pick_to_ungraded(pick_id): sets actual_result and won to NULL for re-grade/repair.
+  • main.py persists only the final displayed "best available" picks (same list as shown).
 
 
-1.9  main.py — Pre-game pipeline
+1.9  main.py and src/main.py — Pre-game pipeline
 
-  • Fetches upcoming NBA events from /v4/sports/basketball_nba/events; filters
-    to games that have not started yet (commence_time > now).
-  • Creates one OddsApiIngestor per event via
-    /v4/sports/basketball_nba/events/{eventId}/odds.
-  • Runs fetch_multi_source_snapshot, aggregate_snapshot_by_best_odds.
-  • Builds projections: fetches last N games via stats.fetch_last_n_games,
-    get_stat_series; supports weighted/simple/exponential, blend, ensemble.
-    Optional matchup adjustment (adjust_for_matchup) for PTS/REB/AST.
-  • rank_props_by_edge(projection_provider, lookup_projection_result, calibration_params, ev_threshold).
-  • Displays Top 10 PRE-GAME +EV bets; alert_high_value_props; log_pick.
-  • Test scripts: test_projection.py, test_optimizer.py, test_optimizer_prob.py,
-    test_database.py, test_alerts.py, radar.py. grade_picks.py for grading.
+  • main.py (thin entrypoint): load_dotenv; fetches upcoming NBA events using
+    timezone-aware betting day (America/Indiana/Indianapolis, BETTING_DAY_ROLLOVER_HOUR=1);
+    filters to games in current betting day with commence_time > now.
+  • Creates one OddsApiIngestor per event; fetch_multi_source_snapshot,
+    aggregate_snapshot_by_best_odds. Optional injury filter (unavailable players excluded).
+  • run_ranking_for_snapshot (in src/main.py): projections (last N, blend/ensemble/season_blend),
+    matchup and context (home/away, rest); rank_props_by_edge; enriches with open-line movement.
+  • Pass props excluded; high-variance filter; final_displayed_picks = exact list shown.
+  • Displays "Best available picks by edge/EV" (no fixed Top N); alert_high_value_props
+    from that list; saves only final_displayed_picks to DB (display = save).
+  • Test scripts: test_projection.py, test_optimizer.py, test_database.py, etc.
+    replay_snapshot.py uses src.run_ranking.run_ranking_for_snapshot.
 
 
 1.10  src/grade_picks.py — Grade picks with actual results
 
-  • grade_picks(db_path): fetches picks from database, uses stats.fetch_game_result
-    to get actual stat from NBA.com, computes won/lost, updates database.
+  • grade_picks(db_path): loads ungraded picks (won IS NULL), uses pick timestamp date
+    as game date. stats.fetch_game_result returns (status, value): "ok", "dnp", "no_match".
+  • Exact game-date match only (no closest-date fallback). No match → skip; DNP/ruled out
+    (MIN 0 or missing on that date) → mark void (won=-1, actual_result=NULL); ok → grade
+    and update actual_result, won (1/0/-1). Logs: no exact date skipped, DNP void, graded outcome.
 
 
-1.11  src/backtest.py — Calibration backtest
+1.11  src/backtest.py — Hit-rate backtest (calibration advanced sections temp disabled)
 
-  • run_backtest(db_path): fits calibration params from historical graded picks
-    (fit_calibration_from_picks), saves to calibration_params.json.
+  • run_backtest(db_path): loads graded picks, excludes pushes (won=-1), prints
+    overall n, wins, hit rate %. Active.
+  • Brier score, log loss, calibration bins, expected EV vs realized profit, and
+    --fit-calibration are temporarily disabled (TEMP DISABLED in code) until
+    p_over_model is populated for all rows; re-enable by uncommenting those sections.
 
 
-1.12  requirements.txt
+1.12  src/stats.py — Game result for grading
+
+  • fetch_game_result(player_nba_id, game_date, stat_type) -> ("ok"|"dnp"|"no_match", value).
+    Exact game-date match only; no closest-date fallback. DNP when MIN=0 on that date.
+    Only exact-date results cached (game_result_cache.json). delete_cached_game_result(...)
+    for repair/invalidation.
+
+1.13  Utilities and repair
+
+  • import_manual_picks.py: one-off script to insert manual/imported picks into
+    primeprop.db (same schema as log_pick). Run: python import_manual_picks.py.
+  • repair_bad_grades.py: fix picks incorrectly graded via wrong-date fallback.
+    Run: python -m src.repair_bad_grades [--pick-id ID] [--void] [--clear-cache].
+    Default: finds Giannis Points 2026-03-08 with won=0; resets to ungraded or --void.
+
+1.14  requirements.txt
 
   - aiohttp, nba_api, pandas, pydantic, python-dotenv, thefuzz (see ingest.py).
 
