@@ -165,161 +165,187 @@ async def run_ranking_for_snapshot(
 
     projected: Dict[Tuple[str, str], Tuple[float, Optional[ProjectionResult], List[float]]] = {}
     semaphore = asyncio.Semaphore(stats_max_concurrency)
+    total_players = len(player_to_stat_types)
+    completed_players = 0
+    progress_lock = asyncio.Lock()
+
+    async def _mark_player_done(player_id: str) -> None:
+        nonlocal completed_players
+        if total_players <= 0:
+            return
+        async with progress_lock:
+            completed_players += 1
+            # Simple text progress bar so the user sees ongoing work instead of a blank screen.
+            fraction = completed_players / total_players
+            bar_width = 30
+            filled = int(bar_width * fraction)
+            bar = "#" * filled + "-" * (bar_width - filled)
+            print(
+                f"\rBuilding projections and ranking props: [{bar}] {completed_players}/{total_players} players",
+                end="",
+                flush=True,
+            )
+            if completed_players == total_players:
+                # Finish the line cleanly once all players are processed.
+                print()
 
     async def process_player(player_id: str, stat_types: List[str]) -> None:
         nonlocal skipped_small_sample, failed_fetch, trend_flagged_count
         nba_id = resolved_nba_ids.get(player_id)
-        if nba_id is None:
-            failed_fetch += 1
-            return
-        async with semaphore:
-            try:
-                games = await fetch_last_n_games(nba_id, n_games_fetch)
-            except Exception:
+        try:
+            if nba_id is None:
                 failed_fetch += 1
                 return
-        if not games:
-            failed_fetch += 1
-            return
+            async with semaphore:
+                try:
+                    games = await fetch_last_n_games(nba_id, n_games_fetch)
+                except Exception:
+                    failed_fetch += 1
+                    return
+            if not games:
+                failed_fetch += 1
+                return
 
-        # Pre-filter: most recent game DNP/0 minutes -> skip player
-        last_game = games[-1]
-        last_min = last_game.get("MIN")
-        if not isinstance(last_min, (int, float)) or last_min <= 0:
-            ingest_counters["skipped_recent_dnp"] = ingest_counters.get("skipped_recent_dnp", 0) + 1
-            return
+            # Pre-filter: most recent game DNP/0 minutes -> skip player
+            last_game = games[-1]
+            last_min = last_game.get("MIN")
+            if not isinstance(last_min, (int, float)) or last_min <= 0:
+                ingest_counters["skipped_recent_dnp"] = ingest_counters.get("skipped_recent_dnp", 0) + 1
+                return
 
-        # Minutes stability filter (MIN_AVG_MINUTES, MAX_MINUTES_STDEV)
-        mins = [g["MIN"] for g in games if "MIN" in g]
-        mins = [m for m in mins if m is not None and isinstance(m, (int, float))]
-        avg_minutes = None
-        minutes_stdev = None
-        if mins:
-            n_min = len(mins)
-            avg_minutes = sum(mins) / n_min
-            if n_min >= 2:
-                minutes_stdev = compute_stdev(mins)
-            else:
-                minutes_stdev = 0.0
-        if avg_minutes is not None and avg_minutes < min_avg_minutes:
-            ingest_counters["skipped_low_minutes"] = ingest_counters.get("skipped_low_minutes", 0) + 1
-            return
-        if minutes_stdev is not None and minutes_stdev > max_minutes_stdev:
-            ingest_counters["skipped_unstable_minutes"] = ingest_counters.get("skipped_unstable_minutes", 0) + 1
-            return
+            # Minutes stability filter (MIN_AVG_MINUTES, MAX_MINUTES_STDEV)
+            mins = [g["MIN"] for g in games if "MIN" in g]
+            mins = [m for m in mins if m is not None and isinstance(m, (int, float))]
+            avg_minutes = None
+            minutes_stdev = None
+            if mins:
+                n_min = len(mins)
+                avg_minutes = sum(mins) / n_min
+                if n_min >= 2:
+                    minutes_stdev = compute_stdev(mins)
+                else:
+                    minutes_stdev = 0.0
+            if avg_minutes is not None and avg_minutes < min_avg_minutes:
+                ingest_counters["skipped_low_minutes"] = ingest_counters.get("skipped_low_minutes", 0) + 1
+                return
+            if minutes_stdev is not None and minutes_stdev > max_minutes_stdev:
+                ingest_counters["skipped_unstable_minutes"] = ingest_counters.get("skipped_unstable_minutes", 0) + 1
+                return
 
-        player_team_abbrev: Optional[str] = None
-        game_home_away = player_id_to_game.get(player_id, (None, None))
-        home_team, away_team = game_home_away
-        if matchup_enabled:
-            player_team_abbrev = get_player_team(nba_id)
-        opponent_metrics_pts = league_avg_metrics
-        opponent_metrics_reb = league_avg_metrics
-        opponent_metrics_ast = league_avg_metrics
-        if matchup_enabled and home_team and away_team and player_team_abbrev:
-            home_abbrev = normalize_team_to_abbrev(home_team)
-            away_abbrev = normalize_team_to_abbrev(away_team)
-            opponent_abbrev = away_abbrev if player_team_abbrev == home_abbrev else home_abbrev
-            opponent_metrics_pts = get_team_metrics(opponent_abbrev)
-            opponent_metrics_reb = get_team_metrics(opponent_abbrev)
-            opponent_metrics_ast = get_team_metrics(opponent_abbrev)
-
-        rest_days = get_rest_days(games, target_game_date)
-        is_home = None
-        if home_team and player_team_abbrev:
-            home_abbrev = normalize_team_to_abbrev(home_team)
-            is_home = player_team_abbrev == home_abbrev
-
-        for stat_type in stat_types:
-            values, mins = get_stat_and_minutes_series(games, stat_type)
-            if not values:
-                continue
-            if winsorize_pct > 0 and winsorize_pct < 0.5:
-                values, _ = winsorize(values, winsorize_pct)
-                # mins stay aligned; winsorize does not change length
-
-            if len(values) < min_games_for_projection:
-                skipped_small_sample += 1
-                continue
-
-            result: Optional[ProjectionResult] = None
-            mean_val: float = 0.0
-
-            if blend_enabled:
-                short_vals = values[-short_n:] if len(values) >= short_n else values
-                long_vals = values[-long_n:] if len(values) >= long_n else values
-                res, _ = blend_short_long_result(
-                    short_vals, long_vals, regression_alpha, projection_method,
-                    stat_type=stat_type, min_games=min_games_for_projection,
-                )
-                if res is not None:
-                    result, mean_val = res, res.mean
-            elif ensemble_enabled:
-                values_short = values[-short_n:] if len(values) >= short_n else values
-                values_long = values[-long_n:] if len(values) >= long_n else values
-                res, _ = ensemble_projection(
-                    ensemble_weights_list, values_short, values_long, regression_alpha,
-                    stat_type=stat_type, min_games=min_games_for_projection,
-                )
-                if res is not None:
-                    result, mean_val = res, res.mean
-            elif season_blend_enabled:
-                base_result = compute_projection_result(
-                    player_id, stat_type, values,
-                    historical_minutes=mins,
-                    n_games=projection_n_games, method=projection_method, min_games=min_games_for_projection,
-                )
-                if base_result is not None:
-                    try:
-                        season_avg = await fetch_season_to_date_avg(nba_id, stat_type)
-                        if season_avg is not None:
-                            result = blend_lastN_with_season(base_result, season_avg, season_blend_alpha)
-                            mean_val = result.mean
-                        else:
-                            result, mean_val = base_result, base_result.mean
-                    except Exception:
-                        result, mean_val = base_result, base_result.mean
-            else:
-                result = compute_projection_result(
-                    player_id, stat_type, values,
-                    historical_minutes=mins,
-                    n_games=projection_n_games, method=projection_method, min_games=min_games_for_projection,
-                )
-                mean_val = result.mean if result else 0.0
-
-            if result is None:
-                continue
-
-            # Context adjustments (is_home, rest_days)
-            if is_home is not None and rest_days is not None:
-                mean_val = apply_context_adjustments(mean_val, stat_type, is_home, rest_days)
-                result = ProjectionResult(mean=mean_val, stdev=result.stdev, n=result.n, confidence=result.confidence)
-
-            # Matchup
+            player_team_abbrev: Optional[str] = None
+            game_home_away = player_id_to_game.get(player_id, (None, None))
+            home_team, away_team = game_home_away
             if matchup_enabled:
-                metric_key = matchup_metric_map.get(stat_type, MATCHUP_METRIC_PTS)
-                opp = opponent_metrics_pts if stat_type == "Points" else (opponent_metrics_reb if stat_type == "Rebounds" else opponent_metrics_ast)
-                mean_val = adjust_for_matchup(mean_val, opp, league_avg_metrics, matchup_strength, metric_key)
-                result = ProjectionResult(mean=mean_val, stdev=result.stdev, n=result.n, confidence=result.confidence)
+                player_team_abbrev = get_player_team(nba_id)
+            opponent_metrics_pts = league_avg_metrics
+            opponent_metrics_reb = league_avg_metrics
+            opponent_metrics_ast = league_avg_metrics
+            if matchup_enabled and home_team and away_team and player_team_abbrev:
+                home_abbrev = normalize_team_to_abbrev(home_team)
+                away_abbrev = normalize_team_to_abbrev(away_team)
+                opponent_abbrev = away_abbrev if player_team_abbrev == home_abbrev else home_abbrev
+                opponent_metrics_pts = get_team_metrics(opponent_abbrev)
+                opponent_metrics_reb = get_team_metrics(opponent_abbrev)
+                opponent_metrics_ast = get_team_metrics(opponent_abbrev)
 
-            # Trend-based instability: short (3) vs medium (10) window; flag if |short_mean - medium_mean| > z * stdev_medium
-            if len(values) >= 3:
-                short_vals = values[-3:]
-                medium_vals = values[-10:] if len(values) >= 10 else values
-                short_mean = sum(short_vals) / len(short_vals)
-                medium_mean = sum(medium_vals) / len(medium_vals)
-                trend_delta = short_mean - medium_mean
-                stdev_medium = compute_stdev(medium_vals)
-                if stdev_medium > 1e-9 and abs(trend_delta) > trend_z_threshold * stdev_medium:
-                    trend_flagged_count += 1
-                    result = ProjectionResult(
-                        mean=result.mean,
-                        stdev=result.stdev * trend_stdev_multiplier,
-                        n=result.n,
-                        confidence="high_variance",
+            rest_days = get_rest_days(games, target_game_date)
+            is_home = None
+            if home_team and player_team_abbrev:
+                home_abbrev = normalize_team_to_abbrev(home_team)
+                is_home = player_team_abbrev == home_abbrev
+
+            for stat_type in stat_types:
+                values, mins = get_stat_and_minutes_series(games, stat_type)
+                if not values:
+                    continue
+                if winsorize_pct > 0 and winsorize_pct < 0.5:
+                    values, _ = winsorize(values, winsorize_pct)
+                    # mins stay aligned; winsorize does not change length
+
+                if len(values) < min_games_for_projection:
+                    skipped_small_sample += 1
+                    continue
+
+                result: Optional[ProjectionResult] = None
+                mean_val: float = 0.0
+
+                if blend_enabled:
+                    short_vals = values[-short_n:] if len(values) >= short_n else values
+                    long_vals = values[-long_n:] if len(values) >= long_n else values
+                    res, _ = blend_short_long_result(
+                        short_vals, long_vals, regression_alpha, projection_method,
+                        stat_type=stat_type, min_games=min_games_for_projection,
                     )
+                    if res is not None:
+                        result, mean_val = res, res.mean
+                elif ensemble_enabled:
+                    values_short = values[-short_n:] if len(values) >= short_n else values
+                    values_long = values[-long_n:] if len(values) >= long_n else values
+                    res, _ = ensemble_projection(
+                        ensemble_weights_list, values_short, values_long, regression_alpha,
+                        stat_type=stat_type, min_games=min_games_for_projection,
+                    )
+                    if res is not None:
+                        result, mean_val = res, res.mean
+                elif season_blend_enabled:
+                    base_result = compute_projection_result(
+                        player_id, stat_type, values,
+                        historical_minutes=mins,
+                        n_games=projection_n_games, method=projection_method, min_games=min_games_for_projection,
+                    )
+                    if base_result is not None:
+                        try:
+                            season_avg = await fetch_season_to_date_avg(nba_id, stat_type)
+                            if season_avg is not None:
+                                result = blend_lastN_with_season(base_result, season_avg, season_blend_alpha)
+                                mean_val = result.mean
+                            else:
+                                result, mean_val = base_result, base_result.mean
+                        except Exception:
+                            result, mean_val = base_result, base_result.mean
+                else:
+                    result = compute_projection_result(
+                        player_id, stat_type, values,
+                        historical_minutes=mins,
+                        n_games=projection_n_games, method=projection_method, min_games=min_games_for_projection,
+                    )
+                    mean_val = result.mean if result else 0.0
 
-            projected[(player_id, stat_type)] = (mean_val, result, values)
+                if result is None:
+                    continue
+
+                # Context adjustments (is_home, rest_days)
+                if is_home is not None and rest_days is not None:
+                    mean_val = apply_context_adjustments(mean_val, stat_type, is_home, rest_days)
+                    result = ProjectionResult(mean=mean_val, stdev=result.stdev, n=result.n, confidence=result.confidence)
+
+                # Matchup
+                if matchup_enabled:
+                    metric_key = matchup_metric_map.get(stat_type, MATCHUP_METRIC_PTS)
+                    opp = opponent_metrics_pts if stat_type == "Points" else (opponent_metrics_reb if stat_type == "Rebounds" else opponent_metrics_ast)
+                    mean_val = adjust_for_matchup(mean_val, opp, league_avg_metrics, matchup_strength, metric_key)
+                    result = ProjectionResult(mean=mean_val, stdev=result.stdev, n=result.n, confidence=result.confidence)
+
+                # Trend-based instability: short (3) vs medium (10) window; flag if |short_mean - medium_mean| > z * stdev_medium
+                if len(values) >= 3:
+                    short_vals = values[-3:]
+                    medium_vals = values[-10:] if len(values) >= 10 else values
+                    short_mean = sum(short_vals) / len(short_vals)
+                    medium_mean = sum(medium_vals) / len(medium_vals)
+                    trend_delta = short_mean - medium_mean
+                    stdev_medium = compute_stdev(medium_vals)
+                    if stdev_medium > 1e-9 and abs(trend_delta) > trend_z_threshold * stdev_medium:
+                        trend_flagged_count += 1
+                        result = ProjectionResult(
+                            mean=result.mean,
+                            stdev=result.stdev * trend_stdev_multiplier,
+                            n=result.n,
+                            confidence="high_variance",
+                        )
+
+                projected[(player_id, stat_type)] = (mean_val, result, values)
+        finally:
+            await _mark_player_done(player_id)
 
     await asyncio.gather(*(process_player(pid, st_list) for pid, st_list in player_to_stat_types.items()))
 

@@ -1,19 +1,3 @@
-"""Expected Value (+EV) optimizer.
-
-EV-based ranking (primary):
-  - American odds -> profit per $1 if win (profit_per_unit).
-  - EV per $1 stake: EV = p_win * profit - (1 - p_win) * 1 (ev_per_unit).
-  - For each PropLine with over_odds and under_odds: compute p_over_model from
-    Normal(mean, stdev) when projection provides mean+stdev; compute EV_over and EV_under;
-    recommend the side with positive and higher EV, else Pass.
-  - Props are sorted by best_ev descending; fallback to abs(edge) when best_ev is missing.
-
-Edge (secondary): Edge = (Projected - Market Line) / Market Line; kept for display and fallback.
-
-ProjectionResult(mean, stdev, n, confidence) from projection.py is supplied by main via get_projection_result;
-main builds it from historical values (mean + sample stdev). Optional calibration: p' = clamp(a*p + b, 0, 1).
-"""
-
 import json
 import math
 import os
